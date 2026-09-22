@@ -1,0 +1,2 @@
+# Study Planner (Phase 1) uses only the Python standard library.
+# No external dependencies are required.
