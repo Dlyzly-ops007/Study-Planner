@@ -50,6 +50,7 @@ class Task:
     status: str = "Not Started"
     description: str = ""
     created_at: str = ""     # YYYY-MM-DD string, set when the task is created
+    completion_date: str = ""  # YYYY-MM-DD string, set when status becomes Completed
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -65,4 +66,8 @@ class Task:
             status=str(data.get("status", "Not Started")),
             description=str(data.get("description", "")),
             created_at=str(data.get("created_at", "")),
+            # .get() with a default means Phase 1 data files (which predate
+            # this field) load fine -- completed tasks saved before Phase 2
+            # simply show no completion date until edited again.
+            completion_date=str(data.get("completion_date", "")),
         )

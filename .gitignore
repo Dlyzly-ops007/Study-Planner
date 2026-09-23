@@ -1,12 +1,11 @@
-# Byte-compiled / cache
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
-venv/
-env/
+# Virtual environment
 .venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
 # IDE
 .vscode/
@@ -16,19 +15,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-# Compiled executable
-*.exe
-
-# Student data / generated data
-*.dat
+# App data — auto-created at runtime, may contain personal study info,
+# and backups of corrupted data files
 data/
-
-# Build output
-*.o
-
-# IDE / OS junk
-.vscode/
-.idea/
+*.bak
 *.tmp

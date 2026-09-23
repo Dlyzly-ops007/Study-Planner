@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 from models import Subject, Task, PRIORITIES, STATUSES, DATE_FORMAT
@@ -265,6 +265,7 @@ class DataManager:
             status=clean_status,
             description=description.strip(),
             created_at=date.today().strftime(DATE_FORMAT),
+            completion_date=date.today().strftime(DATE_FORMAT) if clean_status == "Completed" else "",
         )
         self.tasks[task.id] = task
         self._next_task_id += 1
@@ -298,10 +299,38 @@ class DataManager:
         task.subject_id = subject_id
         task.priority = clean_priority
         task.deadline = clean_deadline
-        task.status = clean_status
         task.description = description.strip()
+        self._apply_status(task, clean_status)
         self.save()
         return task
+
+    def set_task_status(self, task_id: int, status: str) -> Task:
+        """Quick status change (e.g. from a right-click menu) without a full edit."""
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValidationError("Task not found.")
+        clean_status = self.validate_status(status)
+        self._apply_status(task, clean_status)
+        self.save()
+        return task
+
+    def _apply_status(self, task: Task, status: str) -> None:
+        """
+        Centralizes the status <-> completion_date relationship so both
+        edit_task() and set_task_status() behave identically.
+
+        - Moving TO Completed records today's date, unless a completion
+          date is already recorded (editing an already-completed task
+          shouldn't bump its completion date).
+        - Moving AWAY from Completed clears the completion date -- Phase 2
+          keeps this simple rather than preserving a completion history.
+        """
+        task.status = status
+        if status == "Completed":
+            if not task.completion_date:
+                task.completion_date = date.today().strftime(DATE_FORMAT)
+        else:
+            task.completion_date = ""
 
     def delete_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
@@ -316,11 +345,160 @@ class DataManager:
         return sorted(self.tasks.values(), key=lambda t: (t.deadline, t.priority))
 
     # ------------------------------------------------------------------
+    # Search / filter / sort (Phase 2)
+    # ------------------------------------------------------------------
+
+    _PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
+    _STATUS_RANK = {"Not Started": 0, "In Progress": 1, "Completed": 2}
+
+    def _sort_key(self, task: Task, sort_by: str):
+        if sort_by == "title":
+            return task.title.lower()
+        if sort_by == "subject":
+            subject = self.get_subject(task.subject_id)
+            return subject.name.lower() if subject else "\uffff"
+        if sort_by == "priority":
+            return self._PRIORITY_RANK.get(task.priority, 3)
+        if sort_by == "status":
+            return self._STATUS_RANK.get(task.status, 3)
+        if sort_by == "created":
+            return task.created_at or ""
+        # default: deadline (ISO format sorts chronologically as text)
+        return task.deadline or "9999-99-99"
+
+    def deadline_category(self, task: Task, today: Optional[date] = None) -> str:
+        """
+        Classify a task's deadline relative to today, independent of its
+        status -- a task can be "Not Started" and "overdue" at the same
+        time. Completed tasks are never flagged as overdue/due-soon since
+        there's nothing left to be late on.
+
+        Returns one of: "completed", "none", "overdue", "today",
+        "tomorrow", "upcoming" (2-7 days out), "later" (8+ days out).
+        """
+        if task.status == "Completed":
+            return "completed"
+        if not task.deadline:
+            return "none"
+        try:
+            deadline_date = datetime.strptime(task.deadline, DATE_FORMAT).date()
+        except ValueError:
+            return "none"
+        today = today or date.today()
+        delta = (deadline_date - today).days
+        if delta < 0:
+            return "overdue"
+        if delta == 0:
+            return "today"
+        if delta == 1:
+            return "tomorrow"
+        if delta <= 7:
+            return "upcoming"
+        return "later"
+
+    def _deadline_matches(self, task: Task, filter_name: str, today: date) -> bool:
+        if filter_name == "All":
+            return True
+        if not task.deadline:
+            return False
+        try:
+            deadline_date = datetime.strptime(task.deadline, DATE_FORMAT).date()
+        except ValueError:
+            return False
+        if filter_name == "Today":
+            return deadline_date == today
+        if filter_name == "This week":
+            return today <= deadline_date <= today + timedelta(days=7)
+        if filter_name == "Overdue":
+            return deadline_date < today and task.status != "Completed"
+        if filter_name == "Upcoming":
+            return deadline_date > today
+        # Unknown/invalid filter value: don't filter anything out.
+        return True
+
+    def get_tasks_filtered(
+        self,
+        search: str = "",
+        status: str = "All",
+        priority: str = "All",
+        subject_id: Optional[int] = None,
+        deadline_filter: str = "All",
+        exclude_completed: bool = False,
+        sort_by: str = "deadline",
+        reverse: bool = False,
+        today: Optional[date] = None,
+    ) -> list[Task]:
+        """
+        Single source of truth for the Tasks tab, the Upcoming/Overdue
+        view, and any future consumer that needs a filtered task list.
+        Never mutates stored data or task order -- it only returns a new
+        list, sorted for display.
+        """
+        today = today or date.today()
+        search = (search or "").strip().lower()
+        results = []
+        for task in self.tasks.values():
+            if exclude_completed and task.status == "Completed":
+                continue
+            if status != "All" and task.status != status:
+                continue
+            if priority != "All" and task.priority != priority:
+                continue
+            if subject_id is not None and task.subject_id != subject_id:
+                continue
+            if not self._deadline_matches(task, deadline_filter, today):
+                continue
+            if search:
+                subject = self.get_subject(task.subject_id)
+                subject_name = subject.name.lower() if subject else ""
+                haystack = f"{task.title} {task.description} {subject_name}".lower()
+                if search not in haystack:
+                    continue
+            results.append(task)
+        results.sort(key=lambda t: self._sort_key(t, sort_by), reverse=reverse)
+        return results
+
+    def get_tasks_by_date(self, date_str: str) -> list[Task]:
+        """All tasks whose deadline exactly matches date_str (YYYY-MM-DD)."""
+        matches = [t for t in self.tasks.values() if t.deadline == date_str]
+        matches.sort(key=lambda t: self._sort_key(t, "priority"))
+        return matches
+
+    def get_task_days_in_month(self, year: int, month: int) -> set[int]:
+        """Day-of-month numbers (1-31) that have at least one task deadline."""
+        prefix = f"{year:04d}-{month:02d}-"
+        days = set()
+        for task in self.tasks.values():
+            if task.deadline.startswith(prefix):
+                try:
+                    days.add(int(task.deadline[8:10]))
+                except ValueError:
+                    continue
+        return days
+
+    # ------------------------------------------------------------------
     # Dashboard summary
     # ------------------------------------------------------------------
 
     def get_summary(self) -> dict:
+        today = date.today()
         total = len(self.tasks)
         completed = sum(1 for t in self.tasks.values() if t.status == "Completed")
-        pending = total - completed
-        return {"total": total, "completed": completed, "pending": pending}
+        in_progress = sum(1 for t in self.tasks.values() if t.status == "In Progress")
+        not_started = sum(1 for t in self.tasks.values() if t.status == "Not Started")
+        overdue = sum(1 for t in self.tasks.values() if self.deadline_category(t, today) == "overdue")
+        due_today = sum(1 for t in self.tasks.values() if self.deadline_category(t, today) == "today")
+        return {
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "not_started": not_started,
+            "overdue": overdue,
+            "due_today": due_today,
+        }
+
+    def get_subject_summary(self, subject_id: int) -> dict:
+        """Task counts for one subject, used by the Subjects tab."""
+        tasks = [t for t in self.tasks.values() if t.subject_id == subject_id]
+        completed = sum(1 for t in tasks if t.status == "Completed")
+        return {"total": len(tasks), "completed": completed, "pending": len(tasks) - completed}
