@@ -1,2 +1,3 @@
-# Study Planner (Phase 1) uses only the Python standard library.
-# No external dependencies are required.
+# Phase 1/2 used only the Python standard library.
+# Phase 3 adds one dependency, for the Analytics tab's charts:
+matplotlib>=3.7

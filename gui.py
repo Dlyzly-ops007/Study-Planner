@@ -1,14 +1,16 @@
 """
-Tkinter desktop interface for the Study Planner application (Phase 2).
+Tkinter desktop interface for the Study Planner application (Phase 3).
 
 This module only handles presentation and user interaction. All data
 rules (validation, persistence, ID assignment, filtering/sorting/deadline
-classification) live in data_manager.py -- no tab computes those itself,
-they all call into DataManager so the logic is defined exactly once.
+classification, study-time and progress calculations) live in
+data_manager.py -- no tab computes those itself, they all call into
+DataManager so the logic is defined exactly once.
 
-Layout: a ttk.Notebook with four tabs -- Tasks (search/filter/sort table),
+Layout: a ttk.Notebook with six tabs -- Tasks (search/filter/sort table),
 Upcoming (overdue + due-this-week), Calendar (month view + day detail),
-and Subjects (CRUD + per-subject task counts).
+Study Sessions (log + history of study time), Analytics (dashboard +
+charts + subject stats), and Subjects (CRUD + per-subject progress).
 """
 
 from __future__ import annotations
@@ -19,12 +21,16 @@ from datetime import date
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
 from data_manager import DataManager, SubjectHasTasksError, ValidationError
-from models import PRIORITIES, STATUSES, Subject, Task
+from models import PRIORITIES, STATUSES, Subject, StudySession, Task
 
 DEADLINE_FILTERS = ("All", "Today", "This week", "Overdue", "Upcoming")
 STATUS_FILTER_OPTIONS = ("All",) + STATUSES
 PRIORITY_FILTER_OPTIONS = ("All",) + PRIORITIES
+PERIOD_OPTIONS = ("Today", "This week", "This month", "All time")
 
 # Treeview column id -> DataManager sort_by key, for clickable headers.
 SORT_COLUMNS = {
@@ -45,15 +51,15 @@ ROW_TAG_COLORS = {
 
 
 class StudyPlannerApp:
-    """Top-level application: owns the main window and the four tabs."""
+    """Top-level application: owns the main window and the six tabs."""
 
     def __init__(self, root: tk.Tk, data_manager: DataManager):
         self.root = root
         self.dm = data_manager
 
         self.root.title("Study Planner")
-        self.root.geometry("980x600")
-        self.root.minsize(820, 480)
+        self.root.geometry("1100x720")
+        self.root.minsize(900, 560)
 
         header = ttk.Label(self.root, text="Study Planner", font=("Segoe UI", 16, "bold"))
         header.pack(pady=(10, 4))
@@ -64,11 +70,15 @@ class StudyPlannerApp:
         self.tasks_tab = TasksTab(self.notebook, self)
         self.upcoming_tab = UpcomingTab(self.notebook, self)
         self.calendar_tab = CalendarTab(self.notebook, self)
+        self.sessions_tab = StudySessionsTab(self.notebook, self)
+        self.analytics_tab = AnalyticsTab(self.notebook, self)
         self.subjects_tab = SubjectsTab(self.notebook, self)
 
         self.notebook.add(self.tasks_tab, text="Tasks")
         self.notebook.add(self.upcoming_tab, text="Upcoming")
         self.notebook.add(self.calendar_tab, text="Calendar")
+        self.notebook.add(self.sessions_tab, text="Study Sessions")
+        self.notebook.add(self.analytics_tab, text="Analytics")
         self.notebook.add(self.subjects_tab, text="Subjects")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -89,6 +99,8 @@ class StudyPlannerApp:
         self.tasks_tab.refresh()
         self.upcoming_tab.refresh()
         self.calendar_tab.refresh()
+        self.sessions_tab.refresh()
+        self.analytics_tab.refresh()
         self.subjects_tab.refresh()
 
     def notify_data_changed(self) -> None:
@@ -337,6 +349,8 @@ class TasksTab(ttk.Frame):
         TaskDialog(
             self, title="Edit Task", subjects=self.dm.get_subjects(),
             on_submit=lambda values: self._edit_task(task.id, values), initial_task=task,
+            study_minutes=self.dm.get_task_study_minutes(task.id),
+            format_duration=self.dm.format_duration,
         )
 
     def _edit_task(self, task_id: int, values: dict) -> None:
@@ -616,13 +630,17 @@ class SubjectsTab(ttk.Frame):
         if subject is None:
             self.detail_var.set("Select a subject to see its details.")
             return
-        stats = self.dm.get_subject_summary(subject.id)
+        stats = self.dm.get_subject_summary(subject.id)  # period="All time" by default
         description = subject.description or "(no description)"
+        study_time = self.dm.format_duration(stats["study_minutes"])
         self.detail_var.set(
             f"{subject.name}\n\n{description}\n\n"
             f"Total tasks: {stats['total']}\n"
             f"Completed: {stats['completed']}\n"
-            f"Pending: {stats['pending']}"
+            f"Pending: {stats['pending']}\n"
+            f"Overdue: {stats['overdue']}\n"
+            f"Progress: {stats['completion_pct']:.1f}%\n"
+            f"Study time: {study_time}"
         )
 
     def open_add(self) -> None:
@@ -665,16 +683,381 @@ class SubjectsTab(ttk.Frame):
         try:
             self.dm.delete_subject(subject.id)
         except SubjectHasTasksError as exc:
+            parts = []
+            if exc.task_count:
+                parts.append(f"{exc.task_count} task(s)")
+            if exc.session_count:
+                parts.append(f"{exc.session_count} study session(s)")
             messagebox.showwarning(
                 "Cannot delete subject",
-                f"'{exc.subject.name}' still has {exc.task_count} task(s) attached.\n"
-                "Delete or reassign those tasks first, then try again.",
+                f"'{exc.subject.name}' still has {' and '.join(parts)} attached.\n"
+                "Delete or reassign those first, then try again.",
             )
             return
         except ValidationError as exc:
             messagebox.showerror("Cannot delete subject", str(exc))
             return
         self.app.notify_data_changed()
+
+
+class StudySessionsTab(ttk.Frame):
+    """Log study sessions and browse study history."""
+
+    def __init__(self, parent: ttk.Notebook, app: StudyPlannerApp):
+        super().__init__(parent)
+        self.app = app
+        self.dm = app.dm
+        self._selected_session_id: Optional[int] = None
+        self._subject_filter_ids: dict[str, Optional[int]] = {"All": None}
+        self._build()
+
+    def _build(self) -> None:
+        self.summary_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.summary_var, font=("Segoe UI", 9, "bold")).pack(
+            anchor="w", padx=8, pady=(10, 4)
+        )
+
+        filter_bar = ttk.Frame(self)
+        filter_bar.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(filter_bar, text="Show:").pack(side="left")
+        self.period_var = tk.StringVar(value="All time")
+        ttk.Combobox(
+            filter_bar, textvariable=self.period_var, values=PERIOD_OPTIONS,
+            state="readonly", width=12,
+        ).pack(side="left", padx=(4, 12))
+        self.period_var.trace_add("write", lambda *_: self.refresh())
+
+        ttk.Label(filter_bar, text="Subject:").pack(side="left")
+        self.subject_var = tk.StringVar(value="All")
+        self.subject_combo = ttk.Combobox(
+            filter_bar, textvariable=self.subject_var, values=["All"], state="readonly", width=14,
+        )
+        self.subject_combo.pack(side="left", padx=(4, 12))
+        self.subject_var.trace_add("write", lambda *_: self.refresh())
+
+        table_frame = ttk.Frame(self)
+        table_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = ("date", "subject", "task", "duration", "notes")
+        headings = {
+            "date": "Date", "subject": "Subject", "task": "Task",
+            "duration": "Duration", "notes": "Notes",
+        }
+        widths = {"date": 100, "subject": 130, "task": 180, "duration": 90, "notes": 240}
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        vscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        vscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=vscroll.set)
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(pady=(0, 10))
+        ttk.Button(btn_row, text="Log Session", command=self.open_add).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="Edit Session", command=self.open_edit).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="Delete Session", command=self.delete_selected).pack(side="left", padx=3)
+
+    def _on_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        self._selected_session_id = int(selection[0]) if selection else None
+
+    def refresh(self) -> None:
+        subjects = self.dm.get_subjects()
+        names = ["All"] + [s.name for s in subjects]
+        self._subject_filter_ids = {"All": None}
+        for s in subjects:
+            self._subject_filter_ids[s.name] = s.id
+        self.subject_combo.configure(values=names)
+        if self.subject_var.get() not in names:
+            self.subject_var.set("All")
+        subject_id = self._subject_filter_ids.get(self.subject_var.get())
+
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        sessions = self.dm.get_sessions_filtered(period=self.period_var.get(), subject_id=subject_id)
+        if not sessions:
+            self.tree.insert("", tk.END, values=("No study sessions recorded for this period.", "", "", "", ""))
+        else:
+            for session in sessions:
+                subject = self.dm.get_subject(session.subject_id)
+                task = self.dm.get_task(session.task_id) if session.task_id else None
+                if session.task_id and task is None:
+                    task_label = "(deleted task)"
+                else:
+                    task_label = task.title if task else ""
+                self.tree.insert(
+                    "", tk.END, iid=str(session.id),
+                    values=(
+                        session.date,
+                        subject.name if subject else "(deleted)",
+                        task_label,
+                        self.dm.format_duration(session.duration_minutes),
+                        session.notes,
+                    ),
+                )
+
+        summary = self.dm.get_study_time_summary()
+        fmt = self.dm.format_duration
+        self.summary_var.set(
+            f"Total: {fmt(summary['total'])}   Today: {fmt(summary['today'])}   "
+            f"This week: {fmt(summary['this_week'])}   This month: {fmt(summary['this_month'])}"
+        )
+        self._selected_session_id = None
+
+    def open_add(self) -> None:
+        if not self.dm.get_subjects():
+            messagebox.showinfo("Log Session", "Add a subject first.")
+            return
+        SessionDialog(self, dm=self.dm, title="Log Study Session", on_submit=self._add_session)
+
+    def _add_session(self, values: dict) -> None:
+        try:
+            self.dm.add_session(**values)
+        except ValidationError as exc:
+            messagebox.showerror("Cannot log session", str(exc))
+            return
+        self.app.notify_data_changed()
+
+    def open_edit(self) -> None:
+        if self._selected_session_id is None:
+            messagebox.showinfo("Edit Session", "Select a session first.")
+            return
+        session = self.dm.get_session(self._selected_session_id)
+        SessionDialog(
+            self, dm=self.dm, title="Edit Study Session",
+            on_submit=lambda values: self._edit_session(session.id, values), initial_session=session,
+        )
+
+    def _edit_session(self, session_id: int, values: dict) -> None:
+        try:
+            self.dm.edit_session(session_id, **values)
+        except ValidationError as exc:
+            messagebox.showerror("Cannot edit session", str(exc))
+            return
+        self.app.notify_data_changed()
+
+    def delete_selected(self) -> None:
+        if self._selected_session_id is None:
+            messagebox.showinfo("Delete Session", "Select a session first.")
+            return
+        session = self.dm.get_session(self._selected_session_id)
+        subject = self.dm.get_subject(session.subject_id)
+        label = (
+            f"{session.date} - {subject.name if subject else '(deleted)'} "
+            f"({self.dm.format_duration(session.duration_minutes)})"
+        )
+        if not messagebox.askyesno("Delete Session", f"Delete this session?\n{label}"):
+            return
+        try:
+            self.dm.delete_session(session.id)
+        except ValidationError as exc:
+            messagebox.showerror("Cannot delete session", str(exc))
+            return
+        self.app.notify_data_changed()
+
+
+class AnalyticsTab(ttk.Frame):
+    """Dashboard totals, charts, a subject stats table, and a productivity summary.
+
+    Study-time figures (dashboard + charts) respect the period selector.
+    Task completion is a current-state metric and is always shown as of
+    right now, independent of the period selector -- a task doesn't stop
+    being "completed" because you changed the analytics window.
+    """
+
+    def __init__(self, parent: ttk.Notebook, app: StudyPlannerApp):
+        super().__init__(parent)
+        self.app = app
+        self.dm = app.dm
+        self._build()
+
+    def _build(self) -> None:
+        dash_frame = ttk.LabelFrame(self, text="Dashboard")
+        dash_frame.pack(fill="x", padx=8, pady=(10, 6))
+        self.task_summary_var = tk.StringVar()
+        self.study_summary_var = tk.StringVar()
+        self.highlight_var = tk.StringVar()
+        ttk.Label(dash_frame, textvariable=self.task_summary_var).pack(anchor="w", padx=8, pady=(6, 0))
+        ttk.Label(dash_frame, textvariable=self.study_summary_var).pack(anchor="w", padx=8)
+        ttk.Label(dash_frame, textvariable=self.highlight_var, foreground="#555555").pack(
+            anchor="w", padx=8, pady=(0, 6)
+        )
+
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(controls, text="Analytics period:").pack(side="left")
+        self.period_var = tk.StringVar(value="This week")
+        ttk.Combobox(
+            controls, textvariable=self.period_var, values=PERIOD_OPTIONS,
+            state="readonly", width=12,
+        ).pack(side="left", padx=(4, 12))
+        self.period_var.trace_add("write", lambda *_: self.refresh())
+        self.productivity_var = tk.StringVar()
+        ttk.Label(controls, textvariable=self.productivity_var, foreground="#555555").pack(side="left")
+
+        charts_row = ttk.Frame(self)
+        charts_row.pack(fill="x", padx=8, pady=4)
+
+        self.subject_fig = Figure(figsize=(4.3, 2.5), dpi=100)
+        self.subject_ax = self.subject_fig.add_subplot(111)
+        self.subject_canvas = FigureCanvasTkAgg(self.subject_fig, master=charts_row)
+        self.subject_canvas.get_tk_widget().pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.trend_fig = Figure(figsize=(4.3, 2.5), dpi=100)
+        self.trend_ax = self.trend_fig.add_subplot(111)
+        self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=charts_row)
+        self.trend_canvas.get_tk_widget().pack(side="left", fill="both", expand=True, padx=(4, 0))
+
+        self.completion_fig = Figure(figsize=(8.8, 2.0), dpi=100)
+        self.completion_ax = self.completion_fig.add_subplot(111)
+        self.completion_canvas = FigureCanvasTkAgg(self.completion_fig, master=self)
+        self.completion_canvas.get_tk_widget().pack(fill="x", padx=8, pady=4)
+
+        table_frame = ttk.LabelFrame(self, text="Subject Statistics")
+        table_frame.pack(fill="both", expand=True, padx=8, pady=(4, 10))
+        columns = ("subject", "tasks", "completed", "pending", "overdue", "pct", "time")
+        headings = {
+            "subject": "Subject", "tasks": "Tasks", "completed": "Completed", "pending": "Pending",
+            "overdue": "Overdue", "pct": "Progress", "time": "Study Time (period)",
+        }
+        self.stats_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
+        for col in columns:
+            width = 150 if col == "subject" else (130 if col == "time" else 90)
+            self.stats_tree.heading(col, text=headings[col])
+            self.stats_tree.column(col, width=width, anchor="w")
+        self.stats_tree.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def refresh(self) -> None:
+        dash = self.dm.get_dashboard_summary()
+        task = dash["task"]
+        study = dash["study"]
+        fmt = self.dm.format_duration
+
+        self.task_summary_var.set(
+            f"Tasks -- Total: {task['total']}   Completed: {task['completed']}   "
+            f"Pending: {task['not_started'] + task['in_progress']}   Overdue: {task['overdue']}"
+        )
+        self.study_summary_var.set(
+            f"Study Time -- Total: {fmt(study['total'])}   Today: {fmt(study['today'])}   "
+            f"This week: {fmt(study['this_week'])}   This month: {fmt(study['this_month'])}"
+        )
+        highlight_parts = []
+        if dash["most_studied_subject"]:
+            highlight_parts.append(f"Most studied overall: {dash['most_studied_subject']}")
+        if dash["best_completion_subject"]:
+            highlight_parts.append(
+                f"Highest completion: {dash['best_completion_subject']} ({dash['best_completion_pct']:.1f}%)"
+            )
+        self.highlight_var.set("   |   ".join(highlight_parts) if highlight_parts else "No data yet.")
+
+        period = self.period_var.get()
+        self._render_subject_chart(period)
+        self._render_trend_chart(period)
+        self._render_completion_chart()
+        self._render_stats_table(period)
+
+        prod = self.dm.get_productivity_summary(period=period)
+        productivity_text = (
+            f"This period -- Sessions: {prod['session_count']}   "
+            f"Avg length: {fmt(prod['avg_session_minutes'])}   "
+            f"Tasks completed: {prod['tasks_completed']}"
+        )
+        if prod["most_studied_subject"]:
+            productivity_text += f"   Most studied: {prod['most_studied_subject']}"
+        self.productivity_var.set(productivity_text)
+
+    def _render_subject_chart(self, period: str) -> None:
+        ax = self.subject_ax
+        ax.clear()
+        ax.set_title("Study Time by Subject", fontsize=9)
+        data = self.dm.get_study_minutes_by_subject(period=period)
+        if not data:
+            ax.text(0.5, 0.5, "No study sessions\nfor this period.", ha="center", va="center", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            names = [name for name, _ in data]
+            hours = [minutes / 60 for _, minutes in data]
+            ax.bar(names, hours, color="#4a7ebb")
+            ax.set_ylabel("Hours", fontsize=8)
+            ax.tick_params(axis="x", labelrotation=30, labelsize=7)
+            ax.tick_params(axis="y", labelsize=7)
+        self.subject_fig.tight_layout()
+        self.subject_canvas.draw()
+
+    def _render_trend_chart(self, period: str) -> None:
+        ax = self.trend_ax
+        ax.clear()
+        ax.set_title("Study Time Over Time", fontsize=9)
+        # A single-day line isn't informative -- show the week's shape instead.
+        chart_period = "This week" if period == "Today" else period
+        data = self.dm.get_study_minutes_by_day(period=chart_period)
+        if not data:
+            ax.text(0.5, 0.5, "No study sessions\nfor this period.", ha="center", va="center", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            labels = [day[5:] for day, _ in data]  # MM-DD
+            hours = [minutes / 60 for _, minutes in data]
+            ax.plot(labels, hours, marker="o", color="#4a7ebb", markersize=3, linewidth=1.5)
+            ax.set_ylabel("Hours", fontsize=8)
+            stride = max(1, len(labels) // 8)
+            tick_positions = list(range(0, len(labels), stride))
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels([labels[i] for i in tick_positions])
+            ax.tick_params(axis="x", labelrotation=45, labelsize=7)
+            ax.tick_params(axis="y", labelsize=7)
+        self.trend_fig.tight_layout()
+        self.trend_canvas.draw()
+
+    def _render_completion_chart(self) -> None:
+        ax = self.completion_ax
+        ax.clear()
+        ax.set_title("Task Completion by Subject", fontsize=9)
+        data = self.dm.get_task_completion_by_subject()
+        if not data:
+            ax.text(0.5, 0.5, "No subjects yet.", ha="center", va="center", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            names = [name for name, _, _ in data]
+            pct = [(completed / total * 100) if total else 0 for _, completed, total in data]
+            bars = ax.barh(names, pct, color="#5aa469")
+            ax.set_xlim(0, 100)
+            ax.set_xlabel("% complete", fontsize=8)
+            ax.tick_params(axis="both", labelsize=7)
+            for bar, (_, completed, total) in zip(bars, data):
+                ax.text(
+                    min(bar.get_width() + 2, 96), bar.get_y() + bar.get_height() / 2,
+                    f"{completed}/{total}", va="center", fontsize=7,
+                )
+        self.completion_fig.tight_layout()
+        self.completion_canvas.draw()
+
+    def _render_stats_table(self, period: str) -> None:
+        for row in self.stats_tree.get_children():
+            self.stats_tree.delete(row)
+        subjects = self.dm.get_subjects()
+        if not subjects:
+            self.stats_tree.insert("", tk.END, values=("No subjects yet.", "", "", "", "", "", ""))
+            return
+        for subject in subjects:
+            stats = self.dm.get_subject_summary(subject.id, period=period)
+            self.stats_tree.insert(
+                "", tk.END, iid=f"stat{subject.id}",
+                values=(
+                    subject.name, stats["total"], stats["completed"], stats["pending"],
+                    stats["overdue"], f"{stats['completion_pct']:.1f}%",
+                    self.dm.format_duration(stats["study_minutes"]),
+                ),
+            )
 
 
 class SubjectDialog(tk.Toplevel):
@@ -729,6 +1112,8 @@ class TaskDialog(tk.Toplevel):
         subjects: list[Subject],
         on_submit: Callable[[dict], None],
         initial_task: Optional[Task] = None,
+        study_minutes: Optional[int] = None,
+        format_duration: Optional[Callable[[int], str]] = None,
     ):
         super().__init__(parent)
         self.title(title)
@@ -789,6 +1174,14 @@ class TaskDialog(tk.Toplevel):
                 row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2)
             )
             row += 1
+            if study_minutes and format_duration:
+                # Study time spent is informational only -- it never implies
+                # completion; status is still set explicitly above.
+                ttk.Label(
+                    self, text=f"Study time logged: {format_duration(study_minutes)}",
+                    foreground="#555555",
+                ).grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+                row += 1
 
         ttk.Label(self, text="Description:").grid(row=row, column=0, sticky="nw", padx=8, pady=2)
         self.description_text = tk.Text(self, width=34, height=4)
@@ -815,6 +1208,119 @@ class TaskDialog(tk.Toplevel):
             "deadline": self.deadline_var.get(),
             "status": self.status_var.get(),
             "description": self.description_text.get("1.0", "end").strip(),
+        }
+        self.on_submit(values)
+        self.destroy()
+
+
+class SessionDialog(tk.Toplevel):
+    """Modal form for logging or editing a study session."""
+
+    NO_TASK_LABEL = "(none)"
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        dm: DataManager,
+        title: str,
+        on_submit: Callable[[dict], None],
+        initial_session: Optional[StudySession] = None,
+    ):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.dm = dm
+        self.on_submit = on_submit
+        self._task_by_label: dict[str, Optional[int]] = {}
+        subjects = dm.get_subjects()
+        self._subject_by_name = {s.name: s.id for s in subjects}
+        subject_names = [s.name for s in subjects]
+
+        row = 0
+        ttk.Label(self, text="Subject:").grid(row=row, column=0, sticky="w", padx=8, pady=(10, 2))
+        self.subject_var = tk.StringVar()
+        self.subject_combo = ttk.Combobox(
+            self, textvariable=self.subject_var, values=subject_names, state="readonly", width=31,
+        )
+        self.subject_combo.grid(row=row, column=1, padx=8, pady=(10, 2))
+        self.subject_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_task_options())
+        row += 1
+
+        ttk.Label(self, text="Task (optional):").grid(row=row, column=0, sticky="w", padx=8, pady=2)
+        self.task_var = tk.StringVar()
+        self.task_combo = ttk.Combobox(self, textvariable=self.task_var, state="readonly", width=31)
+        self.task_combo.grid(row=row, column=1, padx=8, pady=2)
+        row += 1
+
+        ttk.Label(self, text="Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", padx=8, pady=2)
+        default_date = initial_session.date if initial_session else date.today().strftime("%Y-%m-%d")
+        self.date_var = tk.StringVar(value=default_date)
+        ttk.Entry(self, textvariable=self.date_var, width=34).grid(row=row, column=1, padx=8, pady=2)
+        row += 1
+
+        ttk.Label(self, text="Duration (minutes):").grid(row=row, column=0, sticky="w", padx=8, pady=2)
+        self.duration_var = tk.StringVar(
+            value=str(initial_session.duration_minutes) if initial_session else ""
+        )
+        entry = ttk.Entry(self, textvariable=self.duration_var, width=34)
+        entry.grid(row=row, column=1, padx=8, pady=2)
+        entry.focus_set()
+        row += 1
+
+        ttk.Label(self, text="Notes:").grid(row=row, column=0, sticky="nw", padx=8, pady=2)
+        self.notes_text = tk.Text(self, width=34, height=4)
+        if initial_session:
+            self.notes_text.insert("1.0", initial_session.notes)
+        self.notes_text.grid(row=row, column=1, padx=8, pady=2)
+        row += 1
+
+        btn_row = ttk.Frame(self)
+        btn_row.grid(row=row, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_row, text="Save", command=self._submit).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+        # Set subject/task selection last, once every widget exists.
+        if initial_session:
+            subject = dm.get_subject(initial_session.subject_id)
+            if subject:
+                self.subject_var.set(subject.name)
+        elif subject_names:
+            self.subject_var.set(subject_names[0])
+        self._refresh_task_options(
+            initial_task_id=initial_session.task_id if initial_session else None
+        )
+
+    def _refresh_task_options(self, initial_task_id: Optional[int] = None) -> None:
+        subject_id = self._subject_by_name.get(self.subject_var.get())
+        tasks = (
+            [t for t in self.dm.get_tasks() if t.subject_id == subject_id] if subject_id else []
+        )
+        self._task_by_label = {self.NO_TASK_LABEL: None}
+        labels = [self.NO_TASK_LABEL]
+        selected_label = self.NO_TASK_LABEL
+        for task in tasks:
+            self._task_by_label[task.title] = task.id
+            labels.append(task.title)
+            if initial_task_id is not None and task.id == initial_task_id:
+                selected_label = task.title
+        self.task_combo.configure(values=labels)
+        self.task_var.set(selected_label)
+
+    def _submit(self) -> None:
+        subject_id = self._subject_by_name.get(self.subject_var.get())
+        if subject_id is None:
+            messagebox.showerror("Cannot save session", "Please select a valid subject.")
+            return
+        task_id = self._task_by_label.get(self.task_var.get())
+        values = {
+            "subject_id": subject_id,
+            "task_id": task_id,
+            "date_str": self.date_var.get(),
+            "duration_minutes": self.duration_var.get(),
+            "notes": self.notes_text.get("1.0", "end").strip(),
         }
         self.on_submit(values)
         self.destroy()

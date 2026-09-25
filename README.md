@@ -3,8 +3,10 @@
 ## Overview
 
 Study Planner is a Python desktop application for organizing study tasks
-by subject. It's being developed in phases — this README documents
-**Phase 1 (Core Foundation)** and **Phase 2 (Planning & Organization)**.
+and tracking study time by subject. It's being developed in phases —
+this README documents **Phase 1 (Core Foundation)**, **Phase 2
+(Planning & Organization)**, and **Phase 3 (Study Tracking &
+Analytics)**.
 
 ## Current Functionality
 
@@ -15,105 +17,145 @@ by subject. It's being developed in phases — this README documents
 - Task deadlines (`YYYY-MM-DD`, validated)
 - Task status: `Not Started`, `In Progress`, `Completed`
 - Local JSON persistence, auto-created on first run
-- Basic desktop GUI (Tkinter)
 
-### New in Phase 2
-- **Search** — matches task title, description, or subject name;
-  case-insensitive, partial-match, never modifies stored data.
-- **Filters** — Status, Priority, Subject, and Deadline (`Today` /
-  `This week` / `Overdue` / `Upcoming`), all combinable, plus a
-  "Clear Filters" button. A "Showing X of Y tasks" counter (or a
-  friendly "No tasks match the current filters." message) always
-  reflects the active filters.
-- **Sorting** — click any task table column header to sort by that
-  column; click again to reverse. Sorting only changes what's
-  displayed, never the stored task order.
-- **Deadline awareness** — overdue / due-today / due-tomorrow /
-  upcoming are computed live from the current date, independent of a
-  task's status (e.g. a task can be "Not Started" *and* "Overdue" at
-  the same time). Overdue and due-soon rows are color-highlighted in
-  the task table.
-- **Upcoming tab** — a dedicated "Overdue" list and a "Due in the next
-  7 days" list, both sorted chronologically.
-- **Calendar tab** — a simple month grid (built with Tkinter + the
-  standard `calendar` module, no extra dependency); days with tasks
-  are marked, today is bracketed, and selecting a day shows that
-  day's tasks below.
-- **Quick status change** — right-click a task in the table to jump
-  straight to Not Started / In Progress / Completed without opening
-  the full edit form.
-- **Completion dates** — marking a task Completed records today's
-  date; moving it back off Completed clears that date. Editing an
-  already-completed task does not overwrite its original completion
-  date.
-- **Expanded dashboard** — Total, Completed, In Progress, Not
-  Started, Overdue, and Due Today counts, always current.
-- **Subjects tab** — each subject now shows its total/completed/
-  pending task counts.
+### From Phase 2
+- Search (task title / description / subject name), combinable filters
+  (status, priority, subject, deadline), and clickable-header sorting
+- Deadline awareness (overdue / today / tomorrow / upcoming), shown as
+  color-highlighted rows, independent of a task's status
+- Upcoming tab (Overdue + Due in the next 7 days)
+- Calendar tab — simple month grid, click a day to see its tasks
+- Quick status change via right-click, without opening the full edit form
+- Completion dates, recorded automatically when a task is marked Completed
+
+### New in Phase 3
+- **Study sessions** — log study time against a subject and, optionally,
+  a specific task, with a date, a duration (minutes), and notes.
+- **Study history** — a dedicated Study Sessions tab listing every
+  logged session, filterable by period and subject, with edit/delete.
+- **Study-time tracking** — running totals for Total / Today / This
+  week / This month, shown in a human-friendly format (`1h 30m`, not
+  `1.5h`).
+- **Subject progress** — for every subject: total/completed/pending/
+  overdue tasks, completion percentage, and total study time, all
+  computed live from existing task/session data (nothing is stored as a
+  separate "progress" value).
+- **Task study time** — editing a task shows how much study time has
+  been logged against it. Logging time never changes a task's status —
+  completion and study time stay independent, so you can study for a
+  task without the app assuming it's done.
+- **Analytics tab** — a dashboard (task summary, study-time summary,
+  most-studied subject, highest-completion subject) plus:
+  - *Study Time by Subject* (bar chart)
+  - *Study Time Over Time* (line chart)
+  - *Task Completion by Subject* (bar chart, always current — task
+    completion isn't a historical event the way logged time is, so this
+    chart isn't affected by the period selector)
+  - a Subject Statistics table
+  - a productivity summary line (sessions logged, average session
+    length, tasks completed, most-studied subject) for the selected period
+- **Time period filtering** — Today / This week / This month / All time,
+  applied consistently everywhere a period applies (study history,
+  dashboard, charts, subject stats, productivity summary).
+- Every chart and stats view handles **no data** gracefully (a "No study
+  sessions recorded for this period." message instead of a broken or
+  empty chart).
+
+> **Note on "This week":** the task Deadline filter's "This week" (from
+> Phase 2) looks *forward* — the next 7 days from today, since deadlines
+> are upcoming events. The study-time "This week" period looks *backward*
+> to the start of the current calendar week (Monday) through today, since
+> logged time is a historical record. Both are documented here to avoid
+> confusion; each matches how that kind of data is normally read.
 
 ## Planned Future Functionality (not yet implemented)
 
-- Study session / Pomodoro time tracking
 - Notifications and reminders
-- Advanced analytics and progress charts
-- Automatic scheduling or AI recommendations
-- Cloud sync
-- Login / authentication
+- Automatic scheduling
+- AI recommendations
+- Cloud synchronization
 - Mobile support
+- Advanced settings
+- Complex recurring schedules
+- Authentication
+- Full calendar event management
 
 ## Tech Stack
 
-- Python 3 (standard library only — Tkinter/ttk for the GUI, `json`
-  and `calendar` from the standard library)
+- Python 3
+- Tkinter / ttk for the GUI
+- `json` and `calendar` from the standard library
+- **matplotlib** — the one external dependency, used only for the three
+  Analytics charts (embedded via `FigureCanvasTkAgg`, not opened in
+  separate windows)
 
 ## Project Structure
 
 ```
 study-planner/
 ├── main.py          # Application entry point
-├── models.py         # Subject / Task data representations
-├── data_manager.py   # Validation, CRUD, search/filter/sort, JSON persistence
-├── gui.py             # Tkinter interface: Tasks / Upcoming / Calendar / Subjects tabs
+├── models.py         # Subject / Task / StudySession data representations
+├── data_manager.py   # Validation, CRUD, search/filter/sort, stats, JSON persistence
+├── gui.py             # Tkinter interface: 6 tabs + dialogs
 ├── data/               # Auto-created on first run; holds planner.json
 ├── README.md
 ├── requirements.txt
 └── .gitignore
 ```
 
-- **models.py** — plain data classes for `Subject` and `Task`
-  (`Task` now also carries `completion_date`), with `to_dict` /
-  `from_dict` for JSON conversion. `from_dict` uses `.get()` with
-  defaults, so **Phase 1 data files load unchanged** — a task saved
-  before Phase 2 simply has an empty `completion_date` until it's
-  next marked Completed.
-- **data_manager.py** — still owns all state, validation, ID
-  assignment, and file I/O. Phase 2 adds: `get_tasks_filtered()`
-  (search + filters + sorting in one place), `deadline_category()`
-  (overdue/today/tomorrow/upcoming/later/completed classification),
-  `set_task_status()` (quick status changes with completion-date
-  handling shared with `edit_task()`), `get_tasks_by_date()` /
-  `get_task_days_in_month()` (calendar support), and
-  `get_subject_summary()` (per-subject counts). The GUI still never
-  touches the file or the task/subject dicts directly.
-- **gui.py** — reorganized into a `ttk.Notebook` with four tabs
-  (`TasksTab`, `UpcomingTab`, `CalendarTab`, `SubjectsTab`) plus the
-  `SubjectDialog` / `TaskDialog` popups. No tab computes filtering,
-  sorting, or date math itself — it all comes from `DataManager`.
-- **main.py** — unchanged: creates the Tk root window, wires up
-  `DataManager` and `StudyPlannerApp`, starts the event loop.
+- **models.py** — `Subject`, `Task` (with `completion_date`), and the
+  new `StudySession` (subject, optional task, date, duration in
+  minutes, notes). `StudySession` records a manually-entered duration
+  rather than start/end clock times — simpler to validate ("must be
+  positive") and just as reliable for the totals/charts this app needs.
+  `from_dict()` methods use `.get()` with defaults throughout, so
+  **Phase 1 and Phase 2 data files load unchanged** — a file with no
+  `study_sessions` key at all is simply treated as zero sessions.
+- **data_manager.py** — still the single owner of all state, validation,
+  ID assignment, and file I/O; the GUI never touches the file or the
+  subject/task/session dicts directly. Phase 3 adds session CRUD
+  (`add_session` / `edit_session` / `delete_session`), reusable
+  date-period filtering (`get_sessions_filtered`, shared by the history
+  view, dashboard, and analytics), duration formatting
+  (`format_duration`), and a set of calculation functions used nowhere
+  else but here: `get_study_time_summary`, `get_subject_summary`
+  (extended with completion % / overdue / study time),
+  `get_productivity_summary`, `get_dashboard_summary`, and three
+  chart-data helpers (`get_study_minutes_by_subject`,
+  `get_study_minutes_by_day`, `get_task_completion_by_subject`) — no
+  chart or stats view computes its own numbers.
+- **gui.py** — a `ttk.Notebook` with six tabs: `TasksTab`,
+  `UpcomingTab`, `CalendarTab`, `StudySessionsTab` (new),
+  `AnalyticsTab` (new), and `SubjectsTab`, plus `SubjectDialog`,
+  `TaskDialog`, and the new `SessionDialog`. No tab computes filtering,
+  sorting, date math, or statistics itself — it all comes from
+  `DataManager`; `gui.py` only renders it (including the matplotlib
+  figures, which are built once per tab and redrawn via `ax.clear()`
+  rather than rebuilt from scratch on every refresh).
+- **main.py** — unchanged.
 
-### Deletion safety (unchanged from Phase 1)
+### Deletion safety (extended in Phase 3)
 
-Deleting a subject that still has tasks attached is **blocked**, not
-cascaded — you're told how many tasks are attached and asked to
-delete or reassign them first, so a task is never silently lost.
+Deleting a subject is blocked if it still has **tasks or study
+sessions** attached — you're told what's attached and asked to clean it
+up first, so nothing is ever silently lost. Deleting a *task*, by
+contrast, is **not** blocked by its study sessions: sessions are a
+historical record of time spent, and a task is often deleted well after
+you've finished studying for it. A session that references a deleted
+task keeps its stored `task_id` and simply displays as
+`(deleted task)` in the history — the same pattern already used for a
+deleted subject elsewhere in the app.
 
-### Data integrity (unchanged from Phase 1)
+### Data integrity (unchanged principles, extended in Phase 3)
 
-- IDs are never reused, even after deletions.
+- IDs (subjects, tasks, *and now sessions*) are never reused, even
+  after deletions.
 - Saves are written to a temp file and atomically swapped in.
-- A corrupted data file gets backed up and the app starts fresh
-  instead of crashing or silently discarding it.
+- A corrupted data file gets backed up and the app starts fresh instead
+  of crashing or silently discarding it.
+- All statistics are computed live from `self.tasks` / `self.sessions`
+  on every call — there's no cached or separately-stored total that
+  could drift out of sync after an edit or delete.
 
 ## Installation
 
@@ -139,9 +181,8 @@ Then:
 pip install -r requirements.txt
 ```
 
-> Study Planner has no external dependencies — it only uses the Python
-> standard library. On some Linux distributions, Tkinter isn't installed
-> by default; if `import tkinter` fails, install it separately, e.g.
+> On some Linux distributions, Tkinter isn't installed by default; if
+> `import tkinter` fails, install it separately, e.g.
 > `sudo apt install python3-tk` on Debian/Ubuntu.
 
 ## Running
@@ -154,51 +195,49 @@ On first run, `data/planner.json` is created automatically.
 
 ## Testing performed
 
-**Search:** title, description, and subject-name matches; partial and
-case-insensitive matching; no-match case returns an empty result (and
-a friendly message in the UI), not an error.
+**Study sessions:** add, edit, delete; associated with a subject alone
+and with a subject + task; rejected when the task doesn't belong to the
+selected subject; zero/negative/non-numeric duration rejected; invalid
+date rejected; empty notes allowed.
 
-**Filters:** status, priority, subject, and each deadline bucket
-individually and combined together; "Clear Filters" resets all of
-them.
+**Calculations:** total / daily / weekly / monthly study time; per-task
+and per-subject study time; subject completion percentage; all cross-
+checked against hand-computed expected values, including a
+multi-session, multi-subject scenario.
 
-**Sorting:** deadline, priority, status, subject, and title, both
-ascending and descending via repeated header clicks; confirmed the
-stored task order in the data file is unaffected by display sorting.
+**Analytics:** all three charts and the stats table tested with no
+data, one subject, multiple subjects, and multiple dates across every
+period option (Today / This week / This month / All time) — confirmed
+no crashes and correct "no data" messaging when a period has nothing to
+show.
 
-**Deadlines:** overdue, due-today, due-tomorrow, this-week, and
-later-than-a-week tasks all classified correctly; confirmed a
-completed task is never flagged overdue/due-soon.
+**Interactions:** completing a task and separately logging study time
+against it, confirming subject statistics update correctly after each;
+editing and deleting sessions and confirming totals recalculate
+immediately; deleting a task and confirming its sessions survive and
+display as `(deleted task)`; deleting a subject with zero tasks but an
+attached session, confirming deletion is still correctly blocked.
 
-**Status workflow:** Not Started → In Progress → Completed → back to
-an incomplete status via the quick right-click menu and via the full
-edit form; confirmed a completion date is recorded on completion,
-cleared when un-completed, and *not* overwritten when re-editing an
-already-completed task.
-
-**Calendar:** navigating between months, selecting a date with tasks,
-a date without tasks, and a date with multiple tasks.
-
-**Persistence & backward compatibility:** closing and reopening the
-app preserves all Phase 2 data (including completion dates); loading
-a Phase-1-style JSON file (no `completion_date` field at all) loads
-without errors and defaults that field to empty.
-
-**Edge cases:** an orphaned task (subject deleted outside the app, e.g.
-by hand-editing the JSON) still filters/sorts without crashing and
-shows as "(deleted)" in the subject column.
+**Persistence & backward compatibility:** closing and reopening the app
+preserves all sessions and their IDs; loading a Phase 2-style JSON file
+with no `study_sessions` key at all loads cleanly as zero sessions, and
+a new session can be logged into it immediately afterward.
 
 All of the above were run as real Python test scripts against the
-actual `DataManager` and `gui.py` widgets (the latter driven headlessly
-via Xvfb), not just read over.
+actual `DataManager` and `gui.py` widgets (the GUI tests driven
+headlessly via Xvfb, including constructing the real matplotlib
+canvases), not just read over. A full scripted run of the spec's
+end-to-end workflow — subjects → tasks → sessions → history → subject
+progress → analytics → period changes → edit/delete → restart → verify
+persistence — was also executed successfully.
 
-## What Phase 3 should build
+## What Phase 4 should build
 
-- Advanced analytics/charts (progress over time, completion rate per
-  subject, workload distribution).
-- Study session / time tracking, still without notifications, AI, or
-  sync — those stay out of scope until a later phase per the original
-  roadmap.
-- Keep extending `data_manager.py` / `gui.py` rather than restructuring
-  the Phase 1/2 module split, which has held up well across two
-  phases now.
+- Notifications/reminders, automatic scheduling, and any "smart"
+  suggestions, kept clearly separate from the reliable, deterministic
+  calculations Phase 3 established.
+- Continue extending `data_manager.py` / `gui.py` rather than
+  restructuring — the module split has now held up cleanly across three
+  phases, including a new external dependency (matplotlib) and a third
+  data entity (`StudySession`) without needing to touch the overall
+  architecture.

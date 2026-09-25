@@ -10,6 +10,7 @@ its own.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from typing import Optional
 
 # Allowed values kept in one place so every part of the app agrees on them.
 PRIORITIES: tuple[str, ...] = ("Low", "Medium", "High")
@@ -70,4 +71,37 @@ class Task:
             # this field) load fine -- completed tasks saved before Phase 2
             # simply show no completion date until edited again.
             completion_date=str(data.get("completion_date", "")),
+        )
+
+
+@dataclass
+class StudySession:
+    """
+    A single logged block of study time.
+
+    Phase 3 records a manually-entered duration rather than start/end
+    clock times -- simpler to validate (just "must be positive") and
+    just as reliable for the totals/analytics this app needs.
+    """
+
+    id: int
+    subject_id: int
+    date: str                        # YYYY-MM-DD
+    duration_minutes: int
+    task_id: Optional[int] = None    # optional link to a specific task
+    notes: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "StudySession":
+        raw_task_id = data.get("task_id")
+        return StudySession(
+            id=int(data["id"]),
+            subject_id=int(data["subject_id"]),
+            date=str(data.get("date", "")),
+            duration_minutes=int(data.get("duration_minutes", 0)),
+            task_id=int(raw_task_id) if raw_task_id not in (None, "") else None,
+            notes=str(data.get("notes", "")),
         )

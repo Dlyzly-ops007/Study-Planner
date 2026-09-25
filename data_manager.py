@@ -16,7 +16,7 @@ import shutil
 from datetime import datetime, date, timedelta
 from typing import Optional
 
-from models import Subject, Task, PRIORITIES, STATUSES, DATE_FORMAT
+from models import Subject, Task, StudySession, PRIORITIES, STATUSES, DATE_FORMAT
 
 
 class ValidationError(Exception):
@@ -25,22 +25,26 @@ class ValidationError(Exception):
 
 class SubjectHasTasksError(Exception):
     """
-    Raised when trying to delete a subject that still has tasks attached.
+    Raised when trying to delete a subject that still has tasks and/or
+    study sessions attached.
 
-    Phase 1 deletion policy: a subject with existing tasks is never deleted
-    automatically and a task is never silently destroyed. The caller (the
-    GUI) tells the user how many tasks are attached and asks them to
-    delete or reassign those tasks first. This is the simplest rule that
-    guarantees no task data is ever lost as a side effect of a subject
-    deletion.
+    Deletion policy (unchanged in spirit since Phase 1, extended in
+    Phase 3 to cover sessions too): a subject that's still referenced by
+    anything is never deleted automatically, and nothing is ever
+    silently destroyed. The caller (the GUI) tells the user what's
+    still attached and asks them to clean it up first.
     """
 
-    def __init__(self, subject: Subject, task_count: int):
+    def __init__(self, subject: Subject, task_count: int, session_count: int = 0):
         self.subject = subject
         self.task_count = task_count
-        super().__init__(
-            f"Subject '{subject.name}' still has {task_count} task(s) attached."
-        )
+        self.session_count = session_count
+        parts = []
+        if task_count:
+            parts.append(f"{task_count} task(s)")
+        if session_count:
+            parts.append(f"{session_count} study session(s)")
+        super().__init__(f"Subject '{subject.name}' still has {' and '.join(parts)} attached.")
 
 
 class DataManager:
@@ -50,8 +54,10 @@ class DataManager:
         self.filepath = filepath
         self.subjects: dict[int, Subject] = {}
         self.tasks: dict[int, Task] = {}
+        self.sessions: dict[int, StudySession] = {}
         self._next_subject_id = 1
         self._next_task_id = 1
+        self._next_session_id = 1
         # Set by load() if the existing data file was corrupted and had to
         # be reset. main.py surfaces this to the user via a message box.
         self.startup_warning: Optional[str] = None
@@ -92,11 +98,20 @@ class DataManager:
             tasks = {
                 int(t["id"]): Task.from_dict(t) for t in payload.get("tasks", [])
             }
+            # .get("study_sessions", []) means a Phase 1/2 data file (which
+            # has no session data at all) loads as zero sessions -- no
+            # migration step required.
+            sessions = {
+                int(s["id"]): StudySession.from_dict(s) for s in payload.get("study_sessions", [])
+            }
             next_subject_id = int(
                 payload.get("next_subject_id", self._compute_next_id(subjects))
             )
             next_task_id = int(
                 payload.get("next_task_id", self._compute_next_id(tasks))
+            )
+            next_session_id = int(
+                payload.get("next_session_id", self._compute_next_id(sessions))
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             # Corrupted data file: never overwrite it silently. Back it up
@@ -113,8 +128,10 @@ class DataManager:
 
         self.subjects = subjects
         self.tasks = tasks
+        self.sessions = sessions
         self._next_subject_id = next_subject_id
         self._next_task_id = next_task_id
+        self._next_session_id = next_session_id
 
     def _backup_corrupted_file(self) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -125,8 +142,10 @@ class DataManager:
     def _reset_to_empty(self) -> None:
         self.subjects = {}
         self.tasks = {}
+        self.sessions = {}
         self._next_subject_id = 1
         self._next_task_id = 1
+        self._next_session_id = 1
 
     @staticmethod
     def _compute_next_id(items: dict) -> int:
@@ -137,8 +156,10 @@ class DataManager:
         payload = {
             "subjects": [s.to_dict() for s in self.subjects.values()],
             "tasks": [t.to_dict() for t in self.tasks.values()],
+            "study_sessions": [s.to_dict() for s in self.sessions.values()],
             "next_subject_id": self._next_subject_id,
             "next_task_id": self._next_task_id,
+            "next_session_id": self._next_session_id,
         }
         directory = os.path.dirname(self.filepath)
         if directory:
@@ -187,6 +208,17 @@ class DataManager:
             raise ValidationError("Task title cannot be empty.")
         return value
 
+    @staticmethod
+    def validate_duration(value) -> int:
+        """Accepts an int or a numeric string; must be a positive whole number of minutes."""
+        try:
+            minutes = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValidationError("Duration must be a whole number of minutes.")
+        if minutes <= 0:
+            raise ValidationError("Duration must be greater than zero.")
+        return minutes
+
     def validate_subject_name(self, value: str, *, ignore_id: Optional[int] = None) -> str:
         value = (value or "").strip()
         if not value:
@@ -224,9 +256,10 @@ class DataManager:
         subject = self.get_subject(subject_id)
         if subject is None:
             raise ValidationError("Subject not found.")
-        attached = [t for t in self.tasks.values() if t.subject_id == subject_id]
-        if attached:
-            raise SubjectHasTasksError(subject, len(attached))
+        attached_tasks = [t for t in self.tasks.values() if t.subject_id == subject_id]
+        attached_sessions = [s for s in self.sessions.values() if s.subject_id == subject_id]
+        if attached_tasks or attached_sessions:
+            raise SubjectHasTasksError(subject, len(attached_tasks), len(attached_sessions))
         del self.subjects[subject_id]
         self.save()
 
@@ -333,6 +366,11 @@ class DataManager:
             task.completion_date = ""
 
     def delete_task(self, task_id: int) -> None:
+        # Study sessions may reference this task; we intentionally do NOT
+        # block or cascade here (see SessionDialog / get_task in gui.py --
+        # an orphaned session simply displays "(deleted task)"). A task is
+        # often deleted long after it's done, and its study history is
+        # still worth keeping.
         if task_id not in self.tasks:
             raise ValidationError("Task not found.")
         del self.tasks[task_id]
@@ -477,6 +515,327 @@ class DataManager:
         return days
 
     # ------------------------------------------------------------------
+    # Study session CRUD (Phase 3)
+    # ------------------------------------------------------------------
+
+    def add_session(
+        self,
+        subject_id: int,
+        date_str: str,
+        duration_minutes,
+        task_id: Optional[int] = None,
+        notes: str = "",
+    ) -> StudySession:
+        clean_subject_id, clean_task_id = self._validate_session_links(subject_id, task_id)
+        clean_date = self.validate_date(date_str)
+        clean_duration = self.validate_duration(duration_minutes)
+
+        session = StudySession(
+            id=self._next_session_id,
+            subject_id=clean_subject_id,
+            date=clean_date,
+            duration_minutes=clean_duration,
+            task_id=clean_task_id,
+            notes=notes.strip(),
+        )
+        self.sessions[session.id] = session
+        self._next_session_id += 1
+        self.save()
+        return session
+
+    def edit_session(
+        self,
+        session_id: int,
+        subject_id: int,
+        date_str: str,
+        duration_minutes,
+        task_id: Optional[int] = None,
+        notes: str = "",
+    ) -> StudySession:
+        session = self.get_session(session_id)
+        if session is None:
+            raise ValidationError("Study session not found.")
+        clean_subject_id, clean_task_id = self._validate_session_links(subject_id, task_id)
+        clean_date = self.validate_date(date_str)
+        clean_duration = self.validate_duration(duration_minutes)
+
+        session.subject_id = clean_subject_id
+        session.task_id = clean_task_id
+        session.date = clean_date
+        session.duration_minutes = clean_duration
+        session.notes = notes.strip()
+        self.save()
+        return session
+
+    def _validate_session_links(
+        self, subject_id: int, task_id: Optional[int]
+    ) -> tuple[int, Optional[int]]:
+        if self.get_subject(subject_id) is None:
+            raise ValidationError("Please select a valid subject.")
+        if task_id is None:
+            return subject_id, None
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValidationError("Selected task no longer exists.")
+        if task.subject_id != subject_id:
+            raise ValidationError("The selected task does not belong to the selected subject.")
+        return subject_id, task_id
+
+    def delete_session(self, session_id: int) -> None:
+        if session_id not in self.sessions:
+            raise ValidationError("Study session not found.")
+        del self.sessions[session_id]
+        self.save()
+
+    def get_session(self, session_id: int) -> Optional[StudySession]:
+        return self.sessions.get(session_id)
+
+    def get_sessions(self) -> list[StudySession]:
+        return sorted(self.sessions.values(), key=lambda s: (s.date, s.id), reverse=True)
+
+    # ------------------------------------------------------------------
+    # Date-period filtering (reusable across sessions and stats)
+    # ------------------------------------------------------------------
+
+    PERIODS: tuple[str, ...] = ("Today", "This week", "This month", "All time")
+
+    def _period_bounds(
+        self, period: str, today: Optional[date] = None
+    ) -> tuple[Optional[date], Optional[date]]:
+        """Inclusive (start, end) for a named period, or (None, None) for All time."""
+        today = today or date.today()
+        if period == "Today":
+            return today, today
+        if period == "This week":
+            start = today - timedelta(days=today.weekday())  # Monday
+            return start, today
+        if period == "This month":
+            return today.replace(day=1), today
+        return None, None
+
+    def _session_date(self, session: StudySession) -> Optional[date]:
+        try:
+            return datetime.strptime(session.date, DATE_FORMAT).date()
+        except (ValueError, TypeError):
+            return None
+
+    def get_sessions_filtered(
+        self,
+        period: str = "All time",
+        subject_id: Optional[int] = None,
+        today: Optional[date] = None,
+    ) -> list[StudySession]:
+        """
+        Single source of truth for period + subject filtering of sessions,
+        used by the Study Sessions tab, the dashboard, and analytics alike.
+        Never mutates stored data or order.
+        """
+        start, end = self._period_bounds(period, today)
+        results = []
+        for session in self.sessions.values():
+            if subject_id is not None and session.subject_id != subject_id:
+                continue
+            if start is not None:
+                session_date = self._session_date(session)
+                if session_date is None or not (start <= session_date <= end):
+                    continue
+            results.append(session)
+        results.sort(key=lambda s: (s.date, s.id), reverse=True)
+        return results
+
+    # ------------------------------------------------------------------
+    # Study-duration calculations (Phase 3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def total_minutes(sessions: list[StudySession]) -> int:
+        return sum(s.duration_minutes for s in sessions)
+
+    @staticmethod
+    def format_duration(minutes: int) -> str:
+        """90 -> '1h 30m'; 45 -> '45m'; 120 -> '2h'; avoids decimal hours."""
+        minutes = max(0, int(minutes))
+        hours, mins = divmod(minutes, 60)
+        if hours and mins:
+            return f"{hours}h {mins}m"
+        if hours:
+            return f"{hours}h"
+        return f"{mins}m"
+
+    def get_study_time_summary(self, today: Optional[date] = None) -> dict:
+        today = today or date.today()
+        return {
+            "total": self.total_minutes(list(self.sessions.values())),
+            "today": self.total_minutes(self.get_sessions_filtered("Today", today=today)),
+            "this_week": self.total_minutes(self.get_sessions_filtered("This week", today=today)),
+            "this_month": self.total_minutes(self.get_sessions_filtered("This month", today=today)),
+        }
+
+    def get_task_study_minutes(self, task_id: int) -> int:
+        return sum(s.duration_minutes for s in self.sessions.values() if s.task_id == task_id)
+
+    # ------------------------------------------------------------------
+    # Subject / task / productivity statistics (Phase 3)
+    # ------------------------------------------------------------------
+
+    def get_subject_summary(
+        self, subject_id: int, period: str = "All time", today: Optional[date] = None
+    ) -> dict:
+        """
+        Per-subject task + study-time progress. Everything here is computed
+        live from self.tasks / self.sessions -- there is no separately
+        stored "progress" value to keep in sync.
+        """
+        today = today or date.today()
+        tasks = [t for t in self.tasks.values() if t.subject_id == subject_id]
+        total = len(tasks)
+        completed = sum(1 for t in tasks if t.status == "Completed")
+        pending = total - completed
+        overdue = sum(1 for t in tasks if self.deadline_category(t, today) == "overdue")
+        completion_pct = round((completed / total) * 100, 1) if total else 0.0
+        study_minutes = self.total_minutes(
+            self.get_sessions_filtered(period=period, subject_id=subject_id, today=today)
+        )
+        return {
+            "total": total,
+            "completed": completed,
+            "pending": pending,
+            "overdue": overdue,
+            "completion_pct": completion_pct,
+            "study_minutes": study_minutes,
+        }
+
+    def get_productivity_summary(self, period: str = "This week", today: Optional[date] = None) -> dict:
+        today = today or date.today()
+        sessions = self.get_sessions_filtered(period=period, today=today)
+        session_count = len(sessions)
+        study_minutes = self.total_minutes(sessions)
+        avg_minutes = round(study_minutes / session_count) if session_count else 0
+
+        start, end = self._period_bounds(period, today)
+        tasks_completed = 0
+        for task in self.tasks.values():
+            if task.status != "Completed" or not task.completion_date:
+                continue
+            try:
+                c_date = datetime.strptime(task.completion_date, DATE_FORMAT).date()
+            except ValueError:
+                continue
+            if start is None or (start <= c_date <= end):
+                tasks_completed += 1
+
+        most_studied_subject = self._top_subject_by_minutes(sessions)
+
+        return {
+            "tasks_completed": tasks_completed,
+            "study_minutes": study_minutes,
+            "session_count": session_count,
+            "avg_session_minutes": avg_minutes,
+            "most_studied_subject": most_studied_subject,
+        }
+
+    def _top_subject_by_minutes(self, sessions: list[StudySession]) -> Optional[str]:
+        minutes_by_subject: dict[int, int] = {}
+        for session in sessions:
+            minutes_by_subject[session.subject_id] = (
+                minutes_by_subject.get(session.subject_id, 0) + session.duration_minutes
+            )
+        if not minutes_by_subject:
+            return None
+        top_id = max(minutes_by_subject, key=minutes_by_subject.get)
+        subject = self.get_subject(top_id)
+        return subject.name if subject else "(deleted subject)"
+
+    def get_dashboard_summary(self, today: Optional[date] = None) -> dict:
+        """
+        The upgraded Phase 3 dashboard: task summary + study-time summary +
+        two subject highlights, all derived from existing data (nothing
+        here is a separately maintained value).
+        """
+        today = today or date.today()
+        task_summary = self.get_summary()
+        study_summary = self.get_study_time_summary(today=today)
+        most_studied = self._top_subject_by_minutes(list(self.sessions.values()))
+
+        best_subject_name = None
+        best_pct = -1.0
+        for subject in self.subjects.values():
+            stats = self.get_subject_summary(subject.id, today=today)
+            if stats["total"] == 0:
+                continue
+            if stats["completion_pct"] > best_pct:
+                best_pct = stats["completion_pct"]
+                best_subject_name = subject.name
+
+        return {
+            "task": task_summary,
+            "study": study_summary,
+            "most_studied_subject": most_studied,
+            "best_completion_subject": best_subject_name,
+            "best_completion_pct": best_pct if best_subject_name else None,
+        }
+
+    # ------------------------------------------------------------------
+    # Chart-ready data for the Analytics tab (no plotting logic here --
+    # gui.py owns rendering, this just returns the numbers).
+    # ------------------------------------------------------------------
+
+    def get_study_minutes_by_subject(
+        self, period: str = "All time", today: Optional[date] = None
+    ) -> list[tuple[str, int]]:
+        sessions = self.get_sessions_filtered(period=period, today=today)
+        minutes_by_subject: dict[int, int] = {}
+        for session in sessions:
+            minutes_by_subject[session.subject_id] = (
+                minutes_by_subject.get(session.subject_id, 0) + session.duration_minutes
+            )
+        by_name: dict[str, int] = {}
+        for subject_id, minutes in minutes_by_subject.items():
+            subject = self.get_subject(subject_id)
+            name = subject.name if subject else "(deleted subject)"
+            by_name[name] = by_name.get(name, 0) + minutes
+        return sorted(by_name.items(), key=lambda item: item[1], reverse=True)
+
+    def get_study_minutes_by_day(
+        self, period: str = "This week", today: Optional[date] = None
+    ) -> list[tuple[str, int]]:
+        """[(YYYY-MM-DD, minutes), ...] zero-filled across the period so the
+        line chart shows gaps instead of silently skipping empty days."""
+        today = today or date.today()
+        start, end = self._period_bounds(period, today)
+        if start is None:
+            session_dates = [d for d in (self._session_date(s) for s in self.sessions.values()) if d]
+            if not session_dates:
+                return []
+            start, end = min(session_dates), max(session_dates)
+
+        minutes_by_date: dict[str, int] = {}
+        for session in self.sessions.values():
+            session_date = self._session_date(session)
+            if session_date is None or not (start <= session_date <= end):
+                continue
+            minutes_by_date[session.date] = minutes_by_date.get(session.date, 0) + session.duration_minutes
+
+        days = []
+        cursor = start
+        while cursor <= end:
+            key = cursor.strftime(DATE_FORMAT)
+            days.append((key, minutes_by_date.get(key, 0)))
+            cursor += timedelta(days=1)
+        return days
+
+    def get_task_completion_by_subject(self) -> list[tuple[str, int, int]]:
+        """[(subject_name, completed, total), ...] for every subject, alphabetical."""
+        return [
+            (
+                subject.name,
+                sum(1 for t in self.tasks.values() if t.subject_id == subject.id and t.status == "Completed"),
+                sum(1 for t in self.tasks.values() if t.subject_id == subject.id),
+            )
+            for subject in self.get_subjects()
+        ]
+
+    # ------------------------------------------------------------------
     # Dashboard summary
     # ------------------------------------------------------------------
 
@@ -496,9 +855,3 @@ class DataManager:
             "overdue": overdue,
             "due_today": due_today,
         }
-
-    def get_subject_summary(self, subject_id: int) -> dict:
-        """Task counts for one subject, used by the Subjects tab."""
-        tasks = [t for t in self.tasks.values() if t.subject_id == subject_id]
-        completed = sum(1 for t in tasks if t.status == "Completed")
-        return {"total": len(tasks), "completed": completed, "pending": len(tasks) - completed}
