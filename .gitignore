@@ -20,3 +20,9 @@ Thumbs.db
 data/
 *.bak
 *.tmp
+
+# Claude Code local settings
+.claude/
+
+# Exports people may save inside the project folder
+*.csv

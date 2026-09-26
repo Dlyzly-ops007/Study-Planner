@@ -2,242 +2,261 @@
 
 ## Overview
 
-Study Planner is a Python desktop application for organizing study tasks
-and tracking study time by subject. It's being developed in phases —
-this README documents **Phase 1 (Core Foundation)**, **Phase 2
-(Planning & Organization)**, and **Phase 3 (Study Tracking &
-Analytics)**.
+Study Planner is a desktop application for students to organize study
+tasks by subject, keep track of deadlines, log study time, and see how
+their work is progressing. It runs entirely on your own computer: data is
+stored in a local JSON file, and nothing is ever sent over the network.
 
-## Current Functionality
+## Features
 
-### From Phase 1
-- Subject management (add, view, edit, delete)
-- Task management (add, view, edit, delete)
-- Task priorities: `Low`, `Medium`, `High`
-- Task deadlines (`YYYY-MM-DD`, validated)
-- Task status: `Not Started`, `In Progress`, `Completed`
-- Local JSON persistence, auto-created on first run
+- **Subject management** – add, edit, and delete subjects (a subject that
+  still has tasks or study sessions can't be deleted, so nothing is lost
+  by accident).
+- **Task management** – add, edit, delete, and quickly change status
+  (right-click a task) or edit it (double-click).
+- **Deadlines and priorities** – every task has a deadline (`YYYY-MM-DD`,
+  validated), a priority (`Low` / `Medium` / `High`), and a status
+  (`Not Started` / `In Progress` / `Completed`). Completion dates are
+  recorded automatically.
+- **Search and filtering** – search across task title, description, and
+  subject name; filter by status, priority, subject, and deadline
+  (Today / This week / Overdue / Upcoming); sort by clicking a column
+  header. **Clear Filters** returns to the default view.
+- **Deadline awareness** – overdue, due-today, and due-tomorrow tasks are
+  color-highlighted. The **Upcoming** tab lists overdue tasks and tasks
+  due in the next 7 days.
+- **Calendar** – month grid showing which days have deadlines; click a day
+  to see its tasks.
+- **Study sessions** – log study time (date, duration, notes) against a
+  subject and, optionally, a specific task. Edit, delete, and filter the
+  history by period and subject.
+- **Time and progress tracking** – study-time totals (today, this week,
+  this month, all time) and per-subject progress (completed / pending /
+  overdue tasks, completion %, study time).
+- **Analytics** – a dashboard plus three charts and a subject statistics
+  table (see [Analytics](#analytics)).
+- **Reminders** – a banner under the title always shows how many tasks
+  are overdue, due today, due tomorrow, or due soon (click it to open the
+  Upcoming tab). At startup, and every 30 minutes while the app is open,
+  a popup lists any reminders you haven't been shown yet in this session
+  – the same reminder is never shown twice.
+- **Settings** – default task priority and status, default study-session
+  length, reminders on/off, and the reminder window (1–14 days).
+- **Export** – tasks to CSV, study sessions to CSV, and a plain-text
+  summary report.
+- **Backup and recovery** – create a backup file, and restore from one
+  (validated before anything changes, with an automatic safety copy of
+  your current data).
 
-### From Phase 2
-- Search (task title / description / subject name), combinable filters
-  (status, priority, subject, deadline), and clickable-header sorting
-- Deadline awareness (overdue / today / tomorrow / upcoming), shown as
-  color-highlighted rows, independent of a task's status
-- Upcoming tab (Overdue + Due in the next 7 days)
-- Calendar tab — simple month grid, click a day to see its tasks
-- Quick status change via right-click, without opening the full edit form
-- Completion dates, recorded automatically when a task is marked Completed
+## Screenshots
 
-### New in Phase 3
-- **Study sessions** — log study time against a subject and, optionally,
-  a specific task, with a date, a duration (minutes), and notes.
-- **Study history** — a dedicated Study Sessions tab listing every
-  logged session, filterable by period and subject, with edit/delete.
-- **Study-time tracking** — running totals for Total / Today / This
-  week / This month, shown in a human-friendly format (`1h 30m`, not
-  `1.5h`).
-- **Subject progress** — for every subject: total/completed/pending/
-  overdue tasks, completion percentage, and total study time, all
-  computed live from existing task/session data (nothing is stored as a
-  separate "progress" value).
-- **Task study time** — editing a task shows how much study time has
-  been logged against it. Logging time never changes a task's status —
-  completion and study time stay independent, so you can study for a
-  task without the app assuming it's done.
-- **Analytics tab** — a dashboard (task summary, study-time summary,
-  most-studied subject, highest-completion subject) plus:
-  - *Study Time by Subject* (bar chart)
-  - *Study Time Over Time* (line chart)
-  - *Task Completion by Subject* (bar chart, always current — task
-    completion isn't a historical event the way logged time is, so this
-    chart isn't affected by the period selector)
-  - a Subject Statistics table
-  - a productivity summary line (sessions logged, average session
-    length, tasks completed, most-studied subject) for the selected period
-- **Time period filtering** — Today / This week / This month / All time,
-  applied consistently everywhere a period applies (study history,
-  dashboard, charts, subject stats, productivity summary).
-- Every chart and stats view handles **no data** gracefully (a "No study
-  sessions recorded for this period." message instead of a broken or
-  empty chart).
+| Tasks | Analytics |
+|---|---|
+| ![Tasks tab](docs/screenshots/tasks.png) | ![Analytics tab](docs/screenshots/analytics.png) |
 
-> **Note on "This week":** the task Deadline filter's "This week" (from
-> Phase 2) looks *forward* — the next 7 days from today, since deadlines
-> are upcoming events. The study-time "This week" period looks *backward*
-> to the start of the current calendar week (Monday) through today, since
-> logged time is a historical record. Both are documented here to avoid
-> confusion; each matches how that kind of data is normally read.
+| Calendar | Settings |
+|---|---|
+| ![Calendar tab](docs/screenshots/calendar.png) | ![Settings tab](docs/screenshots/settings.png) |
 
-## Planned Future Functionality (not yet implemented)
-
-- Notifications and reminders
-- Automatic scheduling
-- AI recommendations
-- Cloud synchronization
-- Mobile support
-- Advanced settings
-- Complex recurring schedules
-- Authentication
-- Full calendar event management
+The screenshots use the fictional data in `sample_data/sample_planner.json`.
 
 ## Tech Stack
 
-- Python 3
-- Tkinter / ttk for the GUI
-- `json` and `calendar` from the standard library
-- **matplotlib** — the one external dependency, used only for the three
-  Analytics charts (embedded via `FigureCanvasTkAgg`, not opened in
-  separate windows)
+- **Python 3.9+** (developed and tested on Python 3.12)
+- **Tkinter / ttk** – the GUI (included with Python)
+- **JSON** – local data storage (standard library)
+- **Matplotlib** – the Analytics charts (the only third-party dependency)
 
 ## Project Structure
 
 ```
-study-planner/
-├── main.py          # Application entry point
-├── models.py         # Subject / Task / StudySession data representations
-├── data_manager.py   # Validation, CRUD, search/filter/sort, stats, JSON persistence
-├── gui.py             # Tkinter interface: 6 tabs + dialogs
-├── data/               # Auto-created on first run; holds planner.json
-├── README.md
-├── requirements.txt
-└── .gitignore
+Study-Planner/
+├── main.py              # Entry point: loads data + settings, starts the GUI
+├── models.py            # Dataclasses: Subject, Task, StudySession; allowed values
+├── data_manager.py      # All data rules: CRUD, validation, filtering/sorting,
+│                        #   deadline categories, statistics, saving/loading
+├── validation.py        # Checks/repairs records read from disk (data file or backup)
+├── settings.py          # User preferences with validated defaults
+├── reminders.py         # Groups open tasks into overdue/today/tomorrow/soon
+├── exporter.py          # CSV export, summary report, backup and restore
+├── gui.py               # Main window and the Tasks, Upcoming, Calendar,
+│                        #   Study Sessions, Analytics, and Subjects tabs
+├── gui_tools.py         # Settings tab, reminder banner/popup, File menu actions
+├── tests/               # Unit tests (unittest)
+├── sample_data/         # Fictional example data you can restore to try the app
+├── docs/screenshots/    # README screenshots
+└── requirements.txt
 ```
 
-- **models.py** — `Subject`, `Task` (with `completion_date`), and the
-  new `StudySession` (subject, optional task, date, duration in
-  minutes, notes). `StudySession` records a manually-entered duration
-  rather than start/end clock times — simpler to validate ("must be
-  positive") and just as reliable for the totals/charts this app needs.
-  `from_dict()` methods use `.get()` with defaults throughout, so
-  **Phase 1 and Phase 2 data files load unchanged** — a file with no
-  `study_sessions` key at all is simply treated as zero sessions.
-- **data_manager.py** — still the single owner of all state, validation,
-  ID assignment, and file I/O; the GUI never touches the file or the
-  subject/task/session dicts directly. Phase 3 adds session CRUD
-  (`add_session` / `edit_session` / `delete_session`), reusable
-  date-period filtering (`get_sessions_filtered`, shared by the history
-  view, dashboard, and analytics), duration formatting
-  (`format_duration`), and a set of calculation functions used nowhere
-  else but here: `get_study_time_summary`, `get_subject_summary`
-  (extended with completion % / overdue / study time),
-  `get_productivity_summary`, `get_dashboard_summary`, and three
-  chart-data helpers (`get_study_minutes_by_subject`,
-  `get_study_minutes_by_day`, `get_task_completion_by_subject`) — no
-  chart or stats view computes its own numbers.
-- **gui.py** — a `ttk.Notebook` with six tabs: `TasksTab`,
-  `UpcomingTab`, `CalendarTab`, `StudySessionsTab` (new),
-  `AnalyticsTab` (new), and `SubjectsTab`, plus `SubjectDialog`,
-  `TaskDialog`, and the new `SessionDialog`. No tab computes filtering,
-  sorting, date math, or statistics itself — it all comes from
-  `DataManager`; `gui.py` only renders it (including the matplotlib
-  figures, which are built once per tab and redrawn via `ax.clear()`
-  rather than rebuilt from scratch on every refresh).
-- **main.py** — unchanged.
-
-### Deletion safety (extended in Phase 3)
-
-Deleting a subject is blocked if it still has **tasks or study
-sessions** attached — you're told what's attached and asked to clean it
-up first, so nothing is ever silently lost. Deleting a *task*, by
-contrast, is **not** blocked by its study sessions: sessions are a
-historical record of time spent, and a task is often deleted well after
-you've finished studying for it. A session that references a deleted
-task keeps its stored `task_id` and simply displays as
-`(deleted task)` in the history — the same pattern already used for a
-deleted subject elsewhere in the app.
-
-### Data integrity (unchanged principles, extended in Phase 3)
-
-- IDs (subjects, tasks, *and now sessions*) are never reused, even
-  after deletions.
-- Saves are written to a temp file and atomically swapped in.
-- A corrupted data file gets backed up and the app starts fresh instead
-  of crashing or silently discarding it.
-- All statistics are computed live from `self.tasks` / `self.sessions`
-  on every call — there's no cached or separately-stored total that
-  could drift out of sync after an edit or delete.
+The GUI never reads or writes files or computes statistics itself; it
+always calls `DataManager` (or the small modules above), so every rule and
+every number is defined in one place.
 
 ## Installation
 
+Requires Python 3.9 or newer with Tkinter (included in the standard
+python.org installers for Windows and macOS; on some Linux distributions
+install it separately, e.g. `sudo apt install python3-tk`).
+
 ```bash
+git clone https://github.com/Dlyzly-ops007/Study-Planner.git
+cd Study-Planner
 python -m venv .venv
 ```
 
-Windows:
+Activate the virtual environment:
 
 ```bash
+# Windows
 .venv\Scripts\activate
-```
 
-macOS/Linux:
-
-```bash
+# macOS / Linux
 source .venv/bin/activate
 ```
 
-Then:
+Install the dependency:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> On some Linux distributions, Tkinter isn't installed by default; if
-> `import tkinter` fails, install it separately, e.g.
-> `sudo apt install python3-tk` on Debian/Ubuntu.
+## Usage
 
-## Running
+Start the app from the project folder:
 
 ```bash
 python main.py
 ```
 
-On first run, `data/planner.json` is created automatically.
+1. Open the **Subjects** tab and click **Add Subject**.
+2. On the **Tasks** tab, click **Add Task**. Use the search box and filters
+   to find tasks, click a column header to sort, double-click a task to
+   edit it, and right-click to change its status.
+3. On the **Study Sessions** tab, click **Log Session** to record study
+   time, optionally linked to a task.
+4. Check **Upcoming**, **Calendar**, and **Analytics** for deadlines and
+   progress.
+5. Change defaults and reminder preferences on the **Settings** tab.
+6. Use the **File** menu to export data or to create or restore a backup.
 
-## Testing performed
+To try the app with example data, choose **File → Restore from Backup…**
+and select `sample_data/sample_planner.json`. Your current data is saved
+to a safety copy first.
 
-**Study sessions:** add, edit, delete; associated with a subject alone
-and with a subject + task; rejected when the task doesn't belong to the
-selected subject; zero/negative/non-numeric duration rejected; invalid
-date rejected; empty notes allowed.
+## Data Storage
 
-**Calculations:** total / daily / weekly / monthly study time; per-task
-and per-subject study time; subject completion percentage; all cross-
-checked against hand-computed expected values, including a
-multi-session, multi-subject scenario.
+- Planner data is saved to `data/planner.json` inside the project folder.
+  The file and folder are created on first run and saved after every
+  change.
+- Settings are saved separately to `data/settings.json`. If that file is
+  missing or invalid, defaults are used.
+- Saves are atomic (written to a temporary file, then swapped in), so a
+  crash can't leave a half-written data file.
+- The `data/` folder is in `.gitignore`, so your personal data is never
+  committed.
+- **Validation on startup:** every record is checked. Values that can be
+  safely repaired are fixed (an unknown priority becomes `Medium`, an
+  invalid status becomes `Not Started`, an invalid deadline is cleared so
+  you can set it again). Records that can't be used (e.g. no id, a study
+  session with a zero or negative duration) are skipped. Tasks that point
+  to a missing subject are kept and shown as "(deleted)". If anything was
+  changed, the original file is kept as
+  `data/planner.json.before_repair_<timestamp>.bak` and you're told what
+  was changed.
+- **Corrupted file:** if the file isn't valid JSON, it is kept as
+  `data/planner.json.corrupted_<timestamp>.bak`, you're told about it, and
+  the app starts with an empty planner. You can then restore a backup.
 
-**Analytics:** all three charts and the stats table tested with no
-data, one subject, multiple subjects, and multiple dates across every
-period option (Today / This week / This month / All time) — confirmed
-no crashes and correct "no data" messaging when a period has nothing to
-show.
+## Export & Backup
 
-**Interactions:** completing a task and separately logging study time
-against it, confirming subject statistics update correctly after each;
-editing and deleting sessions and confirming totals recalculate
-immediately; deleting a task and confirming its sessions survive and
-display as `(deleted task)`; deleting a subject with zero tasks but an
-attached session, confirming deletion is still correctly blocked.
+All options are in the **File** menu. Each one opens a save/open dialog
+and confirms whether it worked. Exports never change the app's own data
+file.
 
-**Persistence & backward compatibility:** closing and reopening the app
-preserves all sessions and their IDs; loading a Phase 2-style JSON file
-with no `study_sessions` key at all loads cleanly as zero sessions, and
-a new session can be logged into it immediately afterward.
+| Menu item | Output |
+|---|---|
+| Export Tasks (CSV) | ID, Title, Subject, Priority, Deadline, Status, Created, Completed, Description |
+| Export Study Sessions (CSV) | ID, Date, Subject, Task, Duration (minutes), Notes |
+| Export Summary Report (TXT) | Task totals and completion %, overdue count, study time (total, month, week, today), most-studied subject, study time and completion by subject |
+| Create Backup | A `.json` copy of all planner data (the same format as `data/planner.json`) |
+| Restore from Backup | Replaces all planner data with a backup |
 
-All of the above were run as real Python test scripts against the
-actual `DataManager` and `gui.py` widgets (the GUI tests driven
-headlessly via Xvfb, including constructing the real matplotlib
-canvases), not just read over. A full scripted run of the spec's
-end-to-end workflow — subjects → tasks → sessions → history → subject
-progress → analytics → period changes → edit/delete → restart → verify
-persistence — was also executed successfully.
+CSV files are UTF-8 with a BOM, so Excel shows non-English text correctly.
 
-## What Phase 4 should build
+**Restoring** works like this:
+1. The file is fully validated first. If it isn't a clean Study Planner
+   backup (invalid JSON, wrong structure, or any invalid record), it is
+   rejected and your current data isn't touched.
+2. You see how many subjects, tasks, and sessions it contains and are
+   asked to confirm.
+3. Your current data is copied to `data/backups/before_restore_<timestamp>.json`,
+   and then the backup is loaded.
 
-- Notifications/reminders, automatic scheduling, and any "smart"
-  suggestions, kept clearly separate from the reliable, deterministic
-  calculations Phase 3 established.
-- Continue extending `data_manager.py` / `gui.py` rather than
-  restructuring — the module split has now held up cleanly across three
-  phases, including a new external dependency (matplotlib) and a third
-  data entity (`StudySession`) without needing to touch the overall
-  architecture.
+## Analytics
+
+The **Analytics** tab has:
+
+- **Dashboard** – task totals (total / completed / pending / overdue),
+  study time (total / today / this week / this month), upcoming deadlines
+  within your reminder window, the most-studied subject, and the subject
+  with the highest completion rate.
+- **Period selector** (Today / This week / This month / All time) – applies
+  to the charts, the subject statistics table, and the productivity line
+  (sessions, average session length, tasks completed, most studied).
+- **Charts** – *Study Time by Subject* (bar), *Daily Study Time* (line;
+  "Today" shows the current week, since one point isn't a useful trend),
+  and *Task Completion by Subject* (always shows current completion,
+  because it isn't tied to a time period).
+- **Subject Statistics** table – tasks, completed, pending, overdue,
+  progress %, and study time for the selected period.
+
+Every statistic is calculated from the saved tasks and sessions each time
+it's shown. Nothing is stored separately, so the dashboard, charts, tables,
+and exported report always agree.
+
+> **"This week" means two things:** the task *Deadline* filter's "This
+> week" looks **forward** (the next 7 days), because deadlines are in the
+> future. The study-time "This week" period looks **back** to Monday of
+> the current week, because logged time is in the past.
+
+## Testing
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The 31 unit tests cover task/subject/session CRUD and validation,
+search/filter/sort, deadline categories, consistency between the
+dashboard and analytics numbers, time periods, save/reload, corrupted
+and partially invalid data files, reminders (grouping, window, no
+repeats), settings, CSV and report export, and backup/restore (including
+rejecting invalid backups).
+
+## Limitations
+
+- Reminders appear only inside the app while it's running. There are no
+  operating-system notifications, and nothing runs in the background when
+  the app is closed.
+- Dates are entered and shown as `YYYY-MM-DD` only (no date picker, and no
+  other date formats).
+- Study sessions record a duration, not start and end times, and there is
+  no built-in timer.
+- Single user on a single computer, with no sync. Only one copy of the app
+  should be open on the same data at a time.
+- Only one language (English), and the default Tk theme (no dark mode).
+- Charts need Matplotlib. If it isn't installed, the Analytics tab shows a
+  message instead of charts, and everything else still works.
+
+## Future Improvements
+
+These ideas are **not implemented**:
+
+- Recurring tasks and smarter scheduling
+- A study timer (start/stop)
+- Optional cloud sync or a mobile companion app
+- Deeper productivity analysis (streaks, trends over time)
+
+## License
+
+Licensed under the PolyForm Noncommercial License 1.0.0. See
+[LICENSE](LICENSE).

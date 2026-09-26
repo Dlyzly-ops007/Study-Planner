@@ -17,10 +17,27 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 
 from models import Subject, Task, StudySession, PRIORITIES, STATUSES, DATE_FORMAT
+from validation import ParsedData, PayloadError, parse_payload
+
+
+def write_json_atomic(path: str, payload) -> None:
+    """Write to a temp file then atomically replace, so a crash mid-write
+    can never leave the real file half-written / corrupted."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
 
 
 class ValidationError(Exception):
     """Raised when user-supplied data fails validation. Message is user-facing."""
+
+
+class StorageError(Exception):
+    """Raised when the data file can't be read or written. Message is user-facing."""
 
 
 class SubjectHasTasksError(Exception):
@@ -68,7 +85,12 @@ class DataManager:
     # ------------------------------------------------------------------
 
     def load(self) -> None:
-        """Load data from disk, creating an empty file if none exists yet."""
+        """Load data from disk, creating an empty file if none exists yet.
+
+        Never silently discards data: if the file can't be parsed, or some
+        records had to be repaired/skipped, the original file is copied
+        aside first and startup_warning explains what happened.
+        """
         directory = os.path.dirname(self.filepath)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -81,8 +103,8 @@ class DataManager:
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 raw = f.read().strip()
-        except OSError as exc:
-            raise RuntimeError(f"Could not read data file: {exc}") from exc
+        except (OSError, UnicodeDecodeError) as exc:
+            raise StorageError(f"Could not read data file:\n{self.filepath}\n\n{exc}") from exc
 
         if not raw:
             # Empty file -- treat as a fresh planner instead of crashing.
@@ -91,69 +113,54 @@ class DataManager:
             return
 
         try:
-            payload = json.loads(raw)
-            subjects = {
-                int(s["id"]): Subject.from_dict(s) for s in payload.get("subjects", [])
-            }
-            tasks = {
-                int(t["id"]): Task.from_dict(t) for t in payload.get("tasks", [])
-            }
-            # .get("study_sessions", []) means a Phase 1/2 data file (which
-            # has no session data at all) loads as zero sessions -- no
-            # migration step required.
-            sessions = {
-                int(s["id"]): StudySession.from_dict(s) for s in payload.get("study_sessions", [])
-            }
-            next_subject_id = int(
-                payload.get("next_subject_id", self._compute_next_id(subjects))
-            )
-            next_task_id = int(
-                payload.get("next_task_id", self._compute_next_id(tasks))
-            )
-            next_session_id = int(
-                payload.get("next_session_id", self._compute_next_id(sessions))
-            )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            parsed = parse_payload(json.loads(raw))
+        except (json.JSONDecodeError, PayloadError):
             # Corrupted data file: never overwrite it silently. Back it up
             # so the user can inspect/recover it, then start clean.
-            backup_path = self._backup_corrupted_file()
+            backup_path = self._backup_original_file("corrupted")
             self._reset_to_empty()
             self.save()
             self.startup_warning = (
                 "The saved data file was corrupted and could not be read.\n"
-                f"A backup was saved to:\n{backup_path}\n\n"
-                "Starting with a new, empty planner."
+                f"The original was preserved at:\n{backup_path}\n\n"
+                "Starting with a new, empty planner. If you have a backup, "
+                "use File > Restore from Backup."
             )
             return
 
-        self.subjects = subjects
-        self.tasks = tasks
-        self.sessions = sessions
-        self._next_subject_id = next_subject_id
-        self._next_task_id = next_task_id
-        self._next_session_id = next_session_id
+        self._apply_parsed(parsed)
+        if parsed.issues:
+            backup_path = self._backup_original_file("before_repair")
+            shown = "\n".join(f"- {issue}" for issue in parsed.issues[:10])
+            more = len(parsed.issues) - 10
+            if more > 0:
+                shown += f"\n...and {more} more."
+            self.startup_warning = (
+                "Some saved data was invalid and has been repaired:\n\n"
+                f"{shown}\n\nThe original file was preserved at:\n{backup_path}"
+            )
+            self.save()
 
-    def _backup_corrupted_file(self) -> str:
+    def _apply_parsed(self, parsed: ParsedData) -> None:
+        self.subjects = parsed.subjects
+        self.tasks = parsed.tasks
+        self.sessions = parsed.sessions
+        self._next_subject_id = parsed.next_subject_id
+        self._next_task_id = parsed.next_task_id
+        self._next_session_id = parsed.next_session_id
+
+    def _backup_original_file(self, reason: str) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{self.filepath}.corrupted_{timestamp}.bak"
+        backup_path = f"{self.filepath}.{reason}_{timestamp}.bak"
         shutil.copy2(self.filepath, backup_path)
         return backup_path
 
     def _reset_to_empty(self) -> None:
-        self.subjects = {}
-        self.tasks = {}
-        self.sessions = {}
-        self._next_subject_id = 1
-        self._next_task_id = 1
-        self._next_session_id = 1
+        self._apply_parsed(ParsedData())
 
-    @staticmethod
-    def _compute_next_id(items: dict) -> int:
-        return (max(items.keys()) + 1) if items else 1
-
-    def save(self) -> None:
-        """Write the current in-memory state to disk."""
-        payload = {
+    def to_payload(self) -> dict:
+        """The exact structure written to disk (also the backup format)."""
+        return {
             "subjects": [s.to_dict() for s in self.subjects.values()],
             "tasks": [t.to_dict() for t in self.tasks.values()],
             "study_sessions": [s.to_dict() for s in self.sessions.values()],
@@ -161,31 +168,46 @@ class DataManager:
             "next_task_id": self._next_task_id,
             "next_session_id": self._next_session_id,
         }
-        directory = os.path.dirname(self.filepath)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
 
-        # Write to a temp file then atomically replace, so a crash mid-write
-        # can never leave the real data file half-written / corrupted.
-        tmp_path = f"{self.filepath}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp_path, self.filepath)
+    def save(self) -> None:
+        """Write the current in-memory state to disk."""
+        try:
+            write_json_atomic(self.filepath, self.to_payload())
+        except OSError as exc:
+            raise StorageError(f"Could not save your data:\n{exc}") from exc
+
+    def replace_data(self, payload: dict) -> None:
+        """Replace all planner data (used by restore). Strict: raises
+        PayloadError if the payload needed ANY repair, leaving current data
+        untouched -- a restore should never quietly lose records."""
+        parsed = parse_payload(payload)
+        if parsed.issues:
+            raise PayloadError(
+                "The backup contains invalid records:\n"
+                + "\n".join(f"- {issue}" for issue in parsed.issues[:10])
+            )
+        previous = self.to_payload()
+        self._apply_parsed(parsed)
+        try:
+            self.save()
+        except StorageError:
+            self._apply_parsed(parse_payload(previous))
+            raise
 
     # ------------------------------------------------------------------
     # Validation helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def validate_date(value: str) -> str:
+    def validate_date(value: str, label: str = "Deadline") -> str:
         value = (value or "").strip()
         if not value:
-            raise ValidationError("Deadline cannot be empty.")
+            raise ValidationError(f"{label} cannot be empty.")
         try:
             datetime.strptime(value, DATE_FORMAT)
         except ValueError:
             raise ValidationError(
-                f"Deadline must be in {DATE_FORMAT} format, e.g. 2026-12-31."
+                f"{label} must be a real date in YYYY-MM-DD format, e.g. 2026-12-31."
             )
         return value
 
@@ -527,7 +549,7 @@ class DataManager:
         notes: str = "",
     ) -> StudySession:
         clean_subject_id, clean_task_id = self._validate_session_links(subject_id, task_id)
-        clean_date = self.validate_date(date_str)
+        clean_date = self.validate_date(date_str, "Date")
         clean_duration = self.validate_duration(duration_minutes)
 
         session = StudySession(
@@ -556,7 +578,7 @@ class DataManager:
         if session is None:
             raise ValidationError("Study session not found.")
         clean_subject_id, clean_task_id = self._validate_session_links(subject_id, task_id)
-        clean_date = self.validate_date(date_str)
+        clean_date = self.validate_date(date_str, "Date")
         clean_duration = self.validate_duration(duration_minutes)
 
         session.subject_id = clean_subject_id
@@ -753,7 +775,7 @@ class DataManager:
         here is a separately maintained value).
         """
         today = today or date.today()
-        task_summary = self.get_summary()
+        task_summary = self.get_summary(today)
         study_summary = self.get_study_time_summary(today=today)
         most_studied = self._top_subject_by_minutes(list(self.sessions.values()))
 
@@ -839,8 +861,8 @@ class DataManager:
     # Dashboard summary
     # ------------------------------------------------------------------
 
-    def get_summary(self) -> dict:
-        today = date.today()
+    def get_summary(self, today: Optional[date] = None) -> dict:
+        today = today or date.today()
         total = len(self.tasks)
         completed = sum(1 for t in self.tasks.values() if t.status == "Completed")
         in_progress = sum(1 for t in self.tasks.values() if t.status == "In Progress")
@@ -848,6 +870,7 @@ class DataManager:
         overdue = sum(1 for t in self.tasks.values() if self.deadline_category(t, today) == "overdue")
         due_today = sum(1 for t in self.tasks.values() if self.deadline_category(t, today) == "today")
         return {
+            "completion_pct": round((completed / total) * 100, 1) if total else 0.0,
             "total": total,
             "completed": completed,
             "in_progress": in_progress,

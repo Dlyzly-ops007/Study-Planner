@@ -1,5 +1,5 @@
 """
-Tkinter desktop interface for the Study Planner application (Phase 3).
+Tkinter desktop interface for the Study Planner application.
 
 This module only handles presentation and user interaction. All data
 rules (validation, persistence, ID assignment, filtering/sorting/deadline
@@ -7,25 +7,44 @@ classification, study-time and progress calculations) live in
 data_manager.py -- no tab computes those itself, they all call into
 DataManager so the logic is defined exactly once.
 
-Layout: a ttk.Notebook with six tabs -- Tasks (search/filter/sort table),
-Upcoming (overdue + due-this-week), Calendar (month view + day detail),
-Study Sessions (log + history of study time), Analytics (dashboard +
-charts + subject stats), and Subjects (CRUD + per-subject progress).
+Layout: a File menu (export/backup/restore), a reminder banner, and a
+ttk.Notebook with seven tabs -- Tasks (search/filter/sort table), Upcoming
+(overdue + due-this-week), Calendar (month view + day detail), Study
+Sessions (log + history of study time), Analytics (dashboard + charts +
+subject stats), Subjects (CRUD + per-subject progress), and Settings.
+Phase 4 additions live in gui_tools.py.
 """
 
 from __future__ import annotations
 
 import calendar
+import os
 import tkinter as tk
+import traceback
 from datetime import date
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+try:
+    import warnings
 
-from data_manager import DataManager, SubjectHasTasksError, ValidationError
-from models import PRIORITIES, STATUSES, Subject, StudySession, Task
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    HAS_MATPLOTLIB = True
+    # Harmless at very small window sizes (labels just overlap a bit);
+    # not worth a console warning on every resize.
+    warnings.filterwarnings("ignore", message="Tight layout not applied")
+except ImportError:  # charts are optional; everything else still works
+    HAS_MATPLOTLIB = False
+
+import reminders
+from data_manager import DataManager, StorageError, SubjectHasTasksError, ValidationError
+from gui_tools import FileActions, ReminderController, SettingsTab
+from models import DATE_FORMAT, PRIORITIES, STATUSES, Subject, StudySession, Task
+from settings import Settings
+
+# Errors whose message is written for the user: show it, keep the app running.
+USER_ERRORS = (ValidationError, StorageError)
 
 DEADLINE_FILTERS = ("All", "Today", "This week", "Overdue", "Upcoming")
 STATUS_FILTER_OPTIONS = ("All",) + STATUSES
@@ -53,16 +72,24 @@ ROW_TAG_COLORS = {
 class StudyPlannerApp:
     """Top-level application: owns the main window and the six tabs."""
 
-    def __init__(self, root: tk.Tk, data_manager: DataManager):
+    def __init__(self, root: tk.Tk, data_manager: DataManager, settings: Settings):
         self.root = root
         self.dm = data_manager
+        self.settings = settings
+        self.data_dir = os.path.dirname(os.path.abspath(data_manager.filepath))
 
         self.root.title("Study Planner")
-        self.root.geometry("1100x720")
-        self.root.minsize(900, 560)
+        self.root.geometry("1100x740")
+        self.root.minsize(820, 580)
+        self.root.report_callback_exception = self._report_unexpected_error
+
+        menubar = tk.Menu(self.root)
+        FileActions(self).build_menu(menubar)
+        self.root.configure(menu=menubar)
 
         header = ttk.Label(self.root, text="Study Planner", font=("Segoe UI", 16, "bold"))
-        header.pack(pady=(10, 4))
+        header.pack(pady=(10, 2))
+        self.reminders = ReminderController(self, self.root)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -73,6 +100,7 @@ class StudyPlannerApp:
         self.sessions_tab = StudySessionsTab(self.notebook, self)
         self.analytics_tab = AnalyticsTab(self.notebook, self)
         self.subjects_tab = SubjectsTab(self.notebook, self)
+        self.settings_tab = SettingsTab(self.notebook, self)
 
         self.notebook.add(self.tasks_tab, text="Tasks")
         self.notebook.add(self.upcoming_tab, text="Upcoming")
@@ -80,33 +108,39 @@ class StudyPlannerApp:
         self.notebook.add(self.sessions_tab, text="Study Sessions")
         self.notebook.add(self.analytics_tab, text="Analytics")
         self.notebook.add(self.subjects_tab, text="Subjects")
+        self.notebook.add(self.settings_tab, text="Settings")
 
+        # A tab is refreshed whenever it becomes visible (this event also
+        # fires for the first tab at startup), so data changed on one tab
+        # always shows up on the next.
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        self.refresh_all()
 
         if self.dm.startup_warning:
             messagebox.showwarning("Study Planner", self.dm.startup_warning)
+        # Deferred so the main window is drawn before any reminder popup.
+        self.root.after(500, self.reminders.check_and_notify)
+
+    def _report_unexpected_error(self, exc_type, exc_value, exc_tb) -> None:
+        # A programming bug: keep the full traceback on the console for
+        # debugging, but tell the user instead of failing silently.
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+        messagebox.showerror("Unexpected error", f"Something went wrong:\n{exc_value}")
 
     def _on_tab_changed(self, _event=None) -> None:
-        # Refresh whichever tab just became visible, in case data changed
-        # on another tab (e.g. a task was added on the Tasks tab).
-        tab = self.notebook.nametowidget(self.notebook.select())
-        if hasattr(tab, "refresh"):
-            tab.refresh()
+        self.current_tab().refresh()
 
-    def refresh_all(self) -> None:
-        self.tasks_tab.refresh()
-        self.upcoming_tab.refresh()
-        self.calendar_tab.refresh()
-        self.sessions_tab.refresh()
-        self.analytics_tab.refresh()
-        self.subjects_tab.refresh()
+    def current_tab(self):
+        return self.notebook.nametowidget(self.notebook.select())
+
+    def show_tab(self, tab: ttk.Frame) -> None:
+        self.notebook.select(tab)
 
     def notify_data_changed(self) -> None:
-        """Called by any tab after it adds/edits/deletes data, so every
-        other tab (which may be showing stale counts) stays in sync."""
-        self.refresh_all()
+        """Called by any tab after it adds/edits/deletes data. Only the
+        visible tab is redrawn now; every other tab refreshes itself when
+        it's next shown, so hidden charts aren't regenerated needlessly."""
+        self.current_tab().refresh()
+        self.reminders.refresh_banner()
 
 
 class TasksTab(ttk.Frame):
@@ -128,15 +162,18 @@ class TasksTab(ttk.Frame):
     # -- layout ---------------------------------------------------------
 
     def _build(self) -> None:
-        filter_bar = ttk.Frame(self)
-        filter_bar.pack(fill="x", padx=6, pady=(8, 2))
-
-        ttk.Label(filter_bar, text="Search:").pack(side="left")
+        search_bar = ttk.Frame(self)
+        search_bar.pack(fill="x", padx=6, pady=(8, 2))
+        ttk.Label(search_bar, text="Search:").pack(side="left")
         self.search_var = tk.StringVar()
-        ttk.Entry(filter_bar, textvariable=self.search_var, width=20).pack(
-            side="left", padx=(4, 12)
+        ttk.Entry(search_bar, textvariable=self.search_var).pack(
+            side="left", fill="x", expand=True, padx=(4, 12)
         )
         self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Button(search_bar, text="Clear Filters", command=self._clear_filters).pack(side="left")
+
+        filter_bar = ttk.Frame(self)
+        filter_bar.pack(fill="x", padx=6, pady=(2, 2))
 
         ttk.Label(filter_bar, text="Status:").pack(side="left")
         self.status_var = tk.StringVar(value="All")
@@ -170,8 +207,6 @@ class TasksTab(ttk.Frame):
         ).pack(side="left", padx=(4, 12))
         self.deadline_var.trace_add("write", lambda *_: self.refresh())
 
-        ttk.Button(filter_bar, text="Clear Filters", command=self._clear_filters).pack(side="left")
-
         self.summary_var = tk.StringVar()
         ttk.Label(self, textvariable=self.summary_var, font=("Segoe UI", 9, "bold")).pack(
             anchor="w", padx=8, pady=(6, 0)
@@ -194,10 +229,11 @@ class TasksTab(ttk.Frame):
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         for col in columns:
             self.tree.heading(col, text=headings[col], command=lambda c=col: self._on_sort(c))
-            self.tree.column(col, width=widths[col], anchor="w")
+            self.tree.column(col, width=widths[col], minwidth=60, anchor="w", stretch=(col == "title"))
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Double-1>", lambda _e: self.open_edit())
 
         for tag, color in ROW_TAG_COLORS.items():
             self.tree.tag_configure(tag, foreground=color)
@@ -211,7 +247,7 @@ class TasksTab(ttk.Frame):
         ttk.Button(btn_row, text="Add Task", command=self.open_add).pack(side="left", padx=3)
         ttk.Button(btn_row, text="Edit Task", command=self.open_edit).pack(side="left", padx=3)
         ttk.Button(btn_row, text="Delete Task", command=self.delete_selected).pack(side="left", padx=3)
-        ttk.Label(btn_row, text="  (right-click a task to change its status quickly)",
+        ttk.Label(btn_row, text="  Double-click to edit; right-click to change status.",
                   foreground="#777777").pack(side="left")
 
         self.context_menu = tk.Menu(self, tearoff=0)
@@ -223,11 +259,18 @@ class TasksTab(ttk.Frame):
     # -- filter bar behavior ---------------------------------------------
 
     def _clear_filters(self) -> None:
-        self.search_var.set("")
-        self.status_var.set("All")
-        self.priority_var.set("All")
-        self.subject_var.set("All")
-        self.deadline_var.set("All")
+        # Each .set() would trigger a refresh; batch them into one, and
+        # restore the default sort too so "clear" means the default view.
+        self._refreshing = True
+        try:
+            self.search_var.set("")
+            self.status_var.set("All")
+            self.priority_var.set("All")
+            self.subject_var.set("All")
+            self.deadline_var.set("All")
+            self._sort_by, self._sort_reverse = "deadline", False
+        finally:
+            self._refreshing = False
         self.refresh()
 
     def _on_sort(self, column: str) -> None:
@@ -256,7 +299,7 @@ class TasksTab(ttk.Frame):
             return
         try:
             self.dm.set_task_status(self._selected_task_id, status)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot update status", str(exc))
             return
         self.app.notify_data_changed()
@@ -312,7 +355,7 @@ class TasksTab(ttk.Frame):
         shown = len(filtered)
         if shown == 0:
             self.count_var.set(
-                "No tasks match the current filters." if total else "No tasks yet -- add one to get started."
+                "No tasks match the current filters." if total else "No tasks have been added yet."
             )
         else:
             self.count_var.set(f"Showing {shown} of {total} tasks")
@@ -329,17 +372,22 @@ class TasksTab(ttk.Frame):
 
     def open_add(self) -> None:
         if not self.dm.get_subjects():
-            messagebox.showinfo("Add Task", "Add a subject first.")
+            messagebox.showinfo("Add Task", "Add a subject first (on the Subjects tab).")
             return
-        TaskDialog(self, title="Add Task", subjects=self.dm.get_subjects(), on_submit=self._add_task)
+        TaskDialog(
+            self, title="Add Task", subjects=self.dm.get_subjects(), on_submit=self._add_task,
+            default_priority=self.app.settings.get("default_priority"),
+            default_status=self.app.settings.get("default_status"),
+        )
 
-    def _add_task(self, values: dict) -> None:
+    def _add_task(self, values: dict) -> bool:
         try:
             self.dm.add_task(**values)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot add task", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def open_edit(self) -> None:
         if self._selected_task_id is None:
@@ -353,24 +401,27 @@ class TasksTab(ttk.Frame):
             format_duration=self.dm.format_duration,
         )
 
-    def _edit_task(self, task_id: int, values: dict) -> None:
+    def _edit_task(self, task_id: int, values: dict) -> bool:
         try:
             self.dm.edit_task(task_id, **values)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot edit task", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def delete_selected(self) -> None:
         if self._selected_task_id is None:
             messagebox.showinfo("Delete Task", "Select a task first.")
             return
         task = self.dm.get_task(self._selected_task_id)
-        if not messagebox.askyesno("Delete Task", f"Delete task '{task.title}'?"):
+        if not messagebox.askyesno(
+            "Delete Task", f"Delete task '{task.title}'?\n\nStudy sessions logged for it are kept."
+        ):
             return
         try:
             self.dm.delete_task(task.id)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot delete task", str(exc))
             return
         self.app.notify_data_changed()
@@ -407,7 +458,8 @@ class UpcomingTab(ttk.Frame):
         tree = ttk.Treeview(self, columns=columns, show="headings", height=6)
         for col in columns:
             tree.heading(col, text=headings[col])
-            tree.column(col, width=220 if col == "title" else 110, anchor="w")
+            tree.column(col, width=220 if col == "title" else 110, minwidth=60,
+                        anchor="w", stretch=(col == "title"))
         for tag, color in ROW_TAG_COLORS.items():
             tree.tag_configure(tag, foreground=color)
         return tree
@@ -421,7 +473,7 @@ class UpcomingTab(ttk.Frame):
             deadline_filter="Overdue", exclude_completed=True, sort_by="deadline"
         )
         if not overdue:
-            self.overdue_tree.insert("", tk.END, values=("No overdue tasks", "", "", "", ""))
+            self.overdue_tree.insert("", tk.END, values=("No overdue tasks.", "", "", "", ""))
         else:
             for task in overdue:
                 subject = self.dm.get_subject(task.subject_id)
@@ -438,7 +490,7 @@ class UpcomingTab(ttk.Frame):
         )
         if not upcoming:
             self.upcoming_tree.insert(
-                "", tk.END, values=("Nothing due in the next 7 days", "", "", "", "")
+                "", tk.END, values=("No upcoming deadlines.", "", "", "", "")
             )
         else:
             for task in upcoming:
@@ -462,7 +514,7 @@ class CalendarTab(ttk.Frame):
         today = date.today()
         self._year = today.year
         self._month = today.month
-        self._selected_date: str = today.strftime("%Y-%m-%d")
+        self._selected_date: str = today.strftime(DATE_FORMAT)
         self._build()
 
     def _build(self) -> None:
@@ -474,9 +526,14 @@ class CalendarTab(ttk.Frame):
             side="left", expand=True
         )
         ttk.Button(nav, text="Next >", command=self._next_month).pack(side="right")
+        ttk.Button(nav, text="Today", command=self._go_today).pack(side="right", padx=6)
 
         self.grid_frame = ttk.Frame(self)
         self.grid_frame.pack(padx=8, pady=4)
+        ttk.Label(
+            self, text="Legend:  12* = task(s) due    [12] = today    >12< = selected day",
+            foreground="#555555",
+        ).pack()
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=8, pady=8)
 
@@ -505,6 +562,12 @@ class CalendarTab(ttk.Frame):
             self._month, self._year = 1, self._year + 1
         self.refresh()
 
+    def _go_today(self) -> None:
+        today = date.today()
+        self._year, self._month = today.year, today.month
+        self._selected_date = today.strftime(DATE_FORMAT)
+        self.refresh()
+
     def _select_date(self, date_str: str) -> None:
         self._selected_date = date_str
         self._render_day_grid()
@@ -521,17 +584,17 @@ class CalendarTab(ttk.Frame):
 
         for col, name in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
             ttk.Label(
-                self.grid_frame, text=name, width=6, anchor="center", font=("Segoe UI", 9, "bold")
+                self.grid_frame, text=name, width=7, anchor="center", font=("Segoe UI", 9, "bold")
             ).grid(row=0, column=col, padx=1, pady=1)
 
         days_with_tasks = self.dm.get_task_days_in_month(self._year, self._month)
-        today_str = date.today().strftime("%Y-%m-%d")
+        today_str = date.today().strftime(DATE_FORMAT)
 
         cal = calendar.Calendar(firstweekday=0)  # weeks start Monday
         for r, week in enumerate(cal.monthdayscalendar(self._year, self._month), start=1):
             for c, day in enumerate(week):
                 if day == 0:
-                    ttk.Label(self.grid_frame, text="", width=6).grid(row=r, column=c, padx=1, pady=1)
+                    ttk.Label(self.grid_frame, text="", width=7).grid(row=r, column=c, padx=1, pady=1)
                     continue
                 date_str = f"{self._year:04d}-{self._month:02d}-{day:02d}"
                 label = str(day)
@@ -542,7 +605,7 @@ class CalendarTab(ttk.Frame):
                 if date_str == self._selected_date:
                     label = f">{label}<"
                 ttk.Button(
-                    self.grid_frame, text=label, width=6,
+                    self.grid_frame, text=label, width=7,
                     command=lambda d=date_str: self._select_date(d),
                 ).grid(row=r, column=c, padx=1, pady=1)
 
@@ -552,7 +615,7 @@ class CalendarTab(ttk.Frame):
         self.selected_date_var.set(f"Tasks on {self._selected_date}")
         tasks = self.dm.get_tasks_by_date(self._selected_date)
         if not tasks:
-            self.day_tree.insert("", tk.END, values=("No tasks due on this date", "", "", ""))
+            self.day_tree.insert("", tk.END, values=("No tasks due on this date.", "", "", ""))
             return
         for task in tasks:
             subject = self.dm.get_subject(task.subject_id)
@@ -595,9 +658,9 @@ class SubjectsTab(ttk.Frame):
 
         btn_row = ttk.Frame(list_frame)
         btn_row.grid(row=1, column=0, columnspan=2, pady=(0, 6))
-        ttk.Button(btn_row, text="Add", command=self.open_add).pack(side="left", padx=3)
-        ttk.Button(btn_row, text="Edit", command=self.open_edit).pack(side="left", padx=3)
-        ttk.Button(btn_row, text="Delete", command=self.delete_selected).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="Add Subject", command=self.open_add).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="Edit Subject", command=self.open_edit).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="Delete Subject", command=self.delete_selected).pack(side="left", padx=3)
 
         detail_frame = ttk.LabelFrame(body, text="Subject Details")
         detail_frame.grid(row=0, column=1, sticky="nsew")
@@ -628,7 +691,10 @@ class SubjectsTab(ttk.Frame):
             else None
         )
         if subject is None:
-            self.detail_var.set("Select a subject to see its details.")
+            self.detail_var.set(
+                "Select a subject to see its details." if self._subject_order
+                else "No subjects have been added yet.\nClick 'Add Subject' to create one."
+            )
             return
         stats = self.dm.get_subject_summary(subject.id)  # period="All time" by default
         description = subject.description or "(no description)"
@@ -646,13 +712,14 @@ class SubjectsTab(ttk.Frame):
     def open_add(self) -> None:
         SubjectDialog(self, title="Add Subject", on_submit=self._add_subject)
 
-    def _add_subject(self, name: str, description: str) -> None:
+    def _add_subject(self, name: str, description: str) -> bool:
         try:
             self.dm.add_subject(name, description)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot add subject", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def open_edit(self) -> None:
         if self._selected_subject_id is None:
@@ -665,13 +732,14 @@ class SubjectsTab(ttk.Frame):
             initial_name=subject.name, initial_description=subject.description,
         )
 
-    def _edit_subject(self, subject_id: int, name: str, description: str) -> None:
+    def _edit_subject(self, subject_id: int, name: str, description: str) -> bool:
         try:
             self.dm.edit_subject(subject_id, name, description)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot edit subject", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def delete_selected(self) -> None:
         if self._selected_subject_id is None:
@@ -694,7 +762,7 @@ class SubjectsTab(ttk.Frame):
                 "Delete or reassign those first, then try again.",
             )
             return
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot delete subject", str(exc))
             return
         self.app.notify_data_changed()
@@ -734,6 +802,7 @@ class StudySessionsTab(ttk.Frame):
         )
         self.subject_combo.pack(side="left", padx=(4, 12))
         self.subject_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Button(filter_bar, text="Clear Filters", command=self._clear_filters).pack(side="left")
 
         table_frame = ttk.Frame(self)
         table_frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -749,9 +818,10 @@ class StudySessionsTab(ttk.Frame):
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor="w")
+            self.tree.column(col, width=widths[col], minwidth=60, anchor="w", stretch=(col == "notes"))
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda _e: self.open_edit())
 
         vscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         vscroll.grid(row=0, column=1, sticky="ns")
@@ -762,6 +832,10 @@ class StudySessionsTab(ttk.Frame):
         ttk.Button(btn_row, text="Log Session", command=self.open_add).pack(side="left", padx=3)
         ttk.Button(btn_row, text="Edit Session", command=self.open_edit).pack(side="left", padx=3)
         ttk.Button(btn_row, text="Delete Session", command=self.delete_selected).pack(side="left", padx=3)
+
+    def _clear_filters(self) -> None:
+        self.period_var.set("All time")
+        self.subject_var.set("All")
 
     def _on_select(self, _event=None) -> None:
         selection = self.tree.selection()
@@ -783,7 +857,9 @@ class StudySessionsTab(ttk.Frame):
 
         sessions = self.dm.get_sessions_filtered(period=self.period_var.get(), subject_id=subject_id)
         if not sessions:
-            self.tree.insert("", tk.END, values=("No study sessions recorded for this period.", "", "", "", ""))
+            message = ("No study sessions recorded." if not self.dm.sessions
+                       else "No study sessions match the current filters.")
+            self.tree.insert("", tk.END, values=(message, "", "", "", ""))
         else:
             for session in sessions:
                 subject = self.dm.get_subject(session.subject_id)
@@ -813,17 +889,21 @@ class StudySessionsTab(ttk.Frame):
 
     def open_add(self) -> None:
         if not self.dm.get_subjects():
-            messagebox.showinfo("Log Session", "Add a subject first.")
+            messagebox.showinfo("Log Session", "Add a subject first (on the Subjects tab).")
             return
-        SessionDialog(self, dm=self.dm, title="Log Study Session", on_submit=self._add_session)
+        SessionDialog(
+            self, dm=self.dm, title="Log Study Session", on_submit=self._add_session,
+            default_minutes=self.app.settings.get("default_session_minutes"),
+        )
 
-    def _add_session(self, values: dict) -> None:
+    def _add_session(self, values: dict) -> bool:
         try:
             self.dm.add_session(**values)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot log session", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def open_edit(self) -> None:
         if self._selected_session_id is None:
@@ -835,13 +915,14 @@ class StudySessionsTab(ttk.Frame):
             on_submit=lambda values: self._edit_session(session.id, values), initial_session=session,
         )
 
-    def _edit_session(self, session_id: int, values: dict) -> None:
+    def _edit_session(self, session_id: int, values: dict) -> bool:
         try:
             self.dm.edit_session(session_id, **values)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot edit session", str(exc))
-            return
+            return False
         self.app.notify_data_changed()
+        return True
 
     def delete_selected(self) -> None:
         if self._selected_session_id is None:
@@ -857,7 +938,7 @@ class StudySessionsTab(ttk.Frame):
             return
         try:
             self.dm.delete_session(session.id)
-        except ValidationError as exc:
+        except USER_ERRORS as exc:
             messagebox.showerror("Cannot delete session", str(exc))
             return
         self.app.notify_data_changed()
@@ -884,8 +965,10 @@ class AnalyticsTab(ttk.Frame):
         self.task_summary_var = tk.StringVar()
         self.study_summary_var = tk.StringVar()
         self.highlight_var = tk.StringVar()
+        self.upcoming_var = tk.StringVar()
         ttk.Label(dash_frame, textvariable=self.task_summary_var).pack(anchor="w", padx=8, pady=(6, 0))
         ttk.Label(dash_frame, textvariable=self.study_summary_var).pack(anchor="w", padx=8)
+        ttk.Label(dash_frame, textvariable=self.upcoming_var).pack(anchor="w", padx=8)
         ttk.Label(dash_frame, textvariable=self.highlight_var, foreground="#555555").pack(
             anchor="w", padx=8, pady=(0, 6)
         )
@@ -902,36 +985,50 @@ class AnalyticsTab(ttk.Frame):
         self.productivity_var = tk.StringVar()
         ttk.Label(controls, textvariable=self.productivity_var, foreground="#555555").pack(side="left")
 
-        charts_row = ttk.Frame(self)
-        charts_row.pack(fill="x", padx=8, pady=4)
-
-        self.subject_fig = Figure(figsize=(4.3, 2.5), dpi=100)
-        self.subject_ax = self.subject_fig.add_subplot(111)
-        self.subject_canvas = FigureCanvasTkAgg(self.subject_fig, master=charts_row)
-        self.subject_canvas.get_tk_widget().pack(side="left", fill="both", expand=True, padx=(0, 4))
-
-        self.trend_fig = Figure(figsize=(4.3, 2.5), dpi=100)
-        self.trend_ax = self.trend_fig.add_subplot(111)
-        self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=charts_row)
-        self.trend_canvas.get_tk_widget().pack(side="left", fill="both", expand=True, padx=(4, 0))
-
-        self.completion_fig = Figure(figsize=(8.8, 2.0), dpi=100)
-        self.completion_ax = self.completion_fig.add_subplot(111)
-        self.completion_canvas = FigureCanvasTkAgg(self.completion_fig, master=self)
-        self.completion_canvas.get_tk_widget().pack(fill="x", padx=8, pady=4)
-
+        # Packed before the charts with side="bottom" so that when the window
+        # is short, the charts shrink instead of the table being cut off.
         table_frame = ttk.LabelFrame(self, text="Subject Statistics")
-        table_frame.pack(fill="both", expand=True, padx=8, pady=(4, 10))
+        table_frame.pack(side="bottom", fill="both", expand=True, padx=8, pady=(4, 10))
+        self._build_stats_table(table_frame)
+
+        if HAS_MATPLOTLIB:
+            self._build_charts()
+        else:
+            ttk.Label(
+                self, foreground="#8a4b00",
+                text="Charts are unavailable because matplotlib is not installed "
+                     "(pip install -r requirements.txt). All other statistics still work.",
+            ).pack(anchor="w", padx=8, pady=8)
+
+    def _build_charts(self) -> None:
+        # Three equal-width charts in one row that absorbs any spare height;
+        # uniform grid columns keep them the same size as the window resizes.
+        charts_row = ttk.Frame(self)
+        charts_row.pack(fill="both", expand=True, padx=8, pady=4)
+        charts_row.rowconfigure(0, weight=1)
+
+        def make_chart(column: int):
+            charts_row.columnconfigure(column, weight=1, uniform="chart")
+            fig = Figure(figsize=(3.6, 2.6), dpi=100, layout="tight")
+            canvas = FigureCanvasTkAgg(fig, master=charts_row)
+            canvas.get_tk_widget().grid(row=0, column=column, sticky="nsew", padx=3)
+            return fig, fig.add_subplot(111), canvas
+
+        self.subject_fig, self.subject_ax, self.subject_canvas = make_chart(0)
+        self.trend_fig, self.trend_ax, self.trend_canvas = make_chart(1)
+        self.completion_fig, self.completion_ax, self.completion_canvas = make_chart(2)
+
+    def _build_stats_table(self, table_frame: ttk.LabelFrame) -> None:
         columns = ("subject", "tasks", "completed", "pending", "overdue", "pct", "time")
         headings = {
             "subject": "Subject", "tasks": "Tasks", "completed": "Completed", "pending": "Pending",
             "overdue": "Overdue", "pct": "Progress", "time": "Study Time (period)",
         }
-        self.stats_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
+        self.stats_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=5)
         for col in columns:
             width = 150 if col == "subject" else (130 if col == "time" else 90)
             self.stats_tree.heading(col, text=headings[col])
-            self.stats_tree.column(col, width=width, anchor="w")
+            self.stats_tree.column(col, width=width, minwidth=50, anchor="w")
         self.stats_tree.pack(fill="both", expand=True, padx=6, pady=6)
 
     def refresh(self) -> None:
@@ -955,12 +1052,24 @@ class AnalyticsTab(ttk.Frame):
             highlight_parts.append(
                 f"Highest completion: {dash['best_completion_subject']} ({dash['best_completion_pct']:.1f}%)"
             )
-        self.highlight_var.set("   |   ".join(highlight_parts) if highlight_parts else "No data yet.")
+        self.highlight_var.set("   |   ".join(highlight_parts) if highlight_parts else "Not enough data yet.")
+
+        window = self.app.settings.get("reminder_window_days")
+        groups = reminders.get_reminders(self.dm, window)
+        upcoming = groups["today"] + groups["tomorrow"] + groups["soon"]
+        if upcoming:
+            nxt = upcoming[0]
+            self.upcoming_var.set(
+                f"Upcoming -- {len(upcoming)} due in the next {window} day(s); "
+                f"next: {nxt.title} ({nxt.deadline})"
+            )
+        else:
+            self.upcoming_var.set(f"Upcoming -- No deadlines in the next {window} day(s).")
 
         period = self.period_var.get()
-        self._render_subject_chart(period)
-        self._render_trend_chart(period)
-        self._render_completion_chart()
+        if HAS_MATPLOTLIB:
+            for render in (self._render_subject_chart, self._render_trend_chart, self._render_completion_chart):
+                self._safe_render(render, period)
         self._render_stats_table(period)
 
         prod = self.dm.get_productivity_summary(period=period)
@@ -973,13 +1082,22 @@ class AnalyticsTab(ttk.Frame):
             productivity_text += f"   Most studied: {prod['most_studied_subject']}"
         self.productivity_var.set(productivity_text)
 
+    @staticmethod
+    def _safe_render(render, period: str) -> None:
+        # A chart that fails to draw (e.g. a matplotlib backend problem)
+        # shouldn't take the statistics text/table down with it.
+        try:
+            render(period)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"Chart rendering failed: {exc}")
+
     def _render_subject_chart(self, period: str) -> None:
         ax = self.subject_ax
         ax.clear()
         ax.set_title("Study Time by Subject", fontsize=9)
         data = self.dm.get_study_minutes_by_subject(period=period)
         if not data:
-            ax.text(0.5, 0.5, "No study sessions\nfor this period.", ha="center", va="center", fontsize=8)
+            ax.text(0.5, 0.5, "Not enough data\nfor this period.", ha="center", va="center", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
         else:
@@ -989,24 +1107,24 @@ class AnalyticsTab(ttk.Frame):
             ax.set_ylabel("Hours", fontsize=8)
             ax.tick_params(axis="x", labelrotation=30, labelsize=7)
             ax.tick_params(axis="y", labelsize=7)
-        self.subject_fig.tight_layout()
         self.subject_canvas.draw()
 
     def _render_trend_chart(self, period: str) -> None:
         ax = self.trend_ax
         ax.clear()
-        ax.set_title("Study Time Over Time", fontsize=9)
+        ax.set_title("Daily Study Time", fontsize=9)
         # A single-day line isn't informative -- show the week's shape instead.
         chart_period = "This week" if period == "Today" else period
         data = self.dm.get_study_minutes_by_day(period=chart_period)
         if not data:
-            ax.text(0.5, 0.5, "No study sessions\nfor this period.", ha="center", va="center", fontsize=8)
+            ax.text(0.5, 0.5, "Not enough data\nfor this period.", ha="center", va="center", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
         else:
             labels = [day[5:] for day, _ in data]  # MM-DD
             hours = [minutes / 60 for _, minutes in data]
             ax.plot(labels, hours, marker="o", color="#4a7ebb", markersize=3, linewidth=1.5)
+            ax.set_ylim(bottom=0)
             ax.set_ylabel("Hours", fontsize=8)
             stride = max(1, len(labels) // 8)
             tick_positions = list(range(0, len(labels), stride))
@@ -1014,16 +1132,15 @@ class AnalyticsTab(ttk.Frame):
             ax.set_xticklabels([labels[i] for i in tick_positions])
             ax.tick_params(axis="x", labelrotation=45, labelsize=7)
             ax.tick_params(axis="y", labelsize=7)
-        self.trend_fig.tight_layout()
         self.trend_canvas.draw()
 
-    def _render_completion_chart(self) -> None:
+    def _render_completion_chart(self, _period: str = "") -> None:
         ax = self.completion_ax
         ax.clear()
         ax.set_title("Task Completion by Subject", fontsize=9)
         data = self.dm.get_task_completion_by_subject()
         if not data:
-            ax.text(0.5, 0.5, "No subjects yet.", ha="center", va="center", fontsize=8)
+            ax.text(0.5, 0.5, "No subjects have been added yet.", ha="center", va="center", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
         else:
@@ -1038,7 +1155,6 @@ class AnalyticsTab(ttk.Frame):
                     min(bar.get_width() + 2, 96), bar.get_y() + bar.get_height() / 2,
                     f"{completed}/{total}", va="center", fontsize=7,
                 )
-        self.completion_fig.tight_layout()
         self.completion_canvas.draw()
 
     def _render_stats_table(self, period: str) -> None:
@@ -1046,7 +1162,7 @@ class AnalyticsTab(ttk.Frame):
             self.stats_tree.delete(row)
         subjects = self.dm.get_subjects()
         if not subjects:
-            self.stats_tree.insert("", tk.END, values=("No subjects yet.", "", "", "", "", "", ""))
+            self.stats_tree.insert("", tk.END, values=("No subjects have been added yet.", "", "", "", "", "", ""))
             return
         for subject in subjects:
             stats = self.dm.get_subject_summary(subject.id, period=period)
@@ -1060,6 +1176,25 @@ class AnalyticsTab(ttk.Frame):
             )
 
 
+def _setup_dialog(dialog: tk.Toplevel, parent: tk.Widget, title: str, submit: Callable[[], None]) -> None:
+    """Shared modal behavior so every dialog acts the same way."""
+    dialog.title(title)
+    dialog.resizable(False, False)
+    dialog.transient(parent.winfo_toplevel())
+    dialog.bind("<Escape>", lambda _e: dialog.destroy())
+    # Return submits, except inside multi-line Text fields where it's a newline.
+    dialog.bind("<Return>", lambda e: None if isinstance(e.widget, tk.Text) else submit())
+    dialog.after_idle(lambda: _center_on_parent(dialog, parent.winfo_toplevel()))
+    dialog.grab_set()
+
+
+def _center_on_parent(dialog: tk.Toplevel, parent: tk.Misc) -> None:
+    dialog.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - dialog.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dialog.winfo_height()) // 3
+    dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+
 class SubjectDialog(tk.Toplevel):
     """Modal form for adding or editing a subject."""
 
@@ -1067,15 +1202,12 @@ class SubjectDialog(tk.Toplevel):
         self,
         parent: tk.Widget,
         title: str,
-        on_submit: Callable[[str, str], None],
+        on_submit: Callable[[str, str], bool],
         initial_name: str = "",
         initial_description: str = "",
     ):
         super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
+        _setup_dialog(self, parent, title, self._submit)
 
         self.on_submit = on_submit
 
@@ -1098,8 +1230,9 @@ class SubjectDialog(tk.Toplevel):
     def _submit(self) -> None:
         name = self.name_var.get()
         description = self.description_text.get("1.0", "end").strip()
-        self.on_submit(name, description)
-        self.destroy()
+        # Keep the dialog open on a validation error so input isn't lost.
+        if self.on_submit(name, description):
+            self.destroy()
 
 
 class TaskDialog(tk.Toplevel):
@@ -1110,16 +1243,15 @@ class TaskDialog(tk.Toplevel):
         parent: tk.Widget,
         title: str,
         subjects: list[Subject],
-        on_submit: Callable[[dict], None],
+        on_submit: Callable[[dict], bool],
         initial_task: Optional[Task] = None,
         study_minutes: Optional[int] = None,
         format_duration: Optional[Callable[[int], str]] = None,
+        default_priority: str = "Medium",
+        default_status: str = "Not Started",
     ):
         super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
+        _setup_dialog(self, parent, title, self._submit)
 
         self.on_submit = on_submit
         self._subject_by_name = {s.name: s.id for s in subjects}
@@ -1146,7 +1278,7 @@ class TaskDialog(tk.Toplevel):
         row += 1
 
         ttk.Label(self, text="Priority:").grid(row=row, column=0, sticky="w", padx=8, pady=2)
-        self.priority_var = tk.StringVar(value=initial_task.priority if initial_task else "Medium")
+        self.priority_var = tk.StringVar(value=initial_task.priority if initial_task else default_priority)
         ttk.Combobox(
             self, textvariable=self.priority_var, values=list(PRIORITIES), state="readonly", width=31
         ).grid(row=row, column=1, padx=8, pady=2)
@@ -1160,7 +1292,7 @@ class TaskDialog(tk.Toplevel):
         row += 1
 
         ttk.Label(self, text="Status:").grid(row=row, column=0, sticky="w", padx=8, pady=2)
-        self.status_var = tk.StringVar(value=initial_task.status if initial_task else "Not Started")
+        self.status_var = tk.StringVar(value=initial_task.status if initial_task else default_status)
         ttk.Combobox(
             self, textvariable=self.status_var, values=list(STATUSES), state="readonly", width=31
         ).grid(row=row, column=1, padx=8, pady=2)
@@ -1209,8 +1341,8 @@ class TaskDialog(tk.Toplevel):
             "status": self.status_var.get(),
             "description": self.description_text.get("1.0", "end").strip(),
         }
-        self.on_submit(values)
-        self.destroy()
+        if self.on_submit(values):
+            self.destroy()
 
 
 class SessionDialog(tk.Toplevel):
@@ -1223,14 +1355,12 @@ class SessionDialog(tk.Toplevel):
         parent: tk.Widget,
         dm: DataManager,
         title: str,
-        on_submit: Callable[[dict], None],
+        on_submit: Callable[[dict], bool],
         initial_session: Optional[StudySession] = None,
+        default_minutes: Optional[int] = None,
     ):
         super().__init__(parent)
-        self.title(title)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
+        _setup_dialog(self, parent, title, self._submit)
 
         self.dm = dm
         self.on_submit = on_submit
@@ -1256,14 +1386,14 @@ class SessionDialog(tk.Toplevel):
         row += 1
 
         ttk.Label(self, text="Date (YYYY-MM-DD):").grid(row=row, column=0, sticky="w", padx=8, pady=2)
-        default_date = initial_session.date if initial_session else date.today().strftime("%Y-%m-%d")
+        default_date = initial_session.date if initial_session else date.today().strftime(DATE_FORMAT)
         self.date_var = tk.StringVar(value=default_date)
         ttk.Entry(self, textvariable=self.date_var, width=34).grid(row=row, column=1, padx=8, pady=2)
         row += 1
 
         ttk.Label(self, text="Duration (minutes):").grid(row=row, column=0, sticky="w", padx=8, pady=2)
         self.duration_var = tk.StringVar(
-            value=str(initial_session.duration_minutes) if initial_session else ""
+            value=str(initial_session.duration_minutes) if initial_session else str(default_minutes or "")
         )
         entry = ttk.Entry(self, textvariable=self.duration_var, width=34)
         entry.grid(row=row, column=1, padx=8, pady=2)
@@ -1322,5 +1452,5 @@ class SessionDialog(tk.Toplevel):
             "duration_minutes": self.duration_var.get(),
             "notes": self.notes_text.get("1.0", "end").strip(),
         }
-        self.on_submit(values)
-        self.destroy()
+        if self.on_submit(values):
+            self.destroy()

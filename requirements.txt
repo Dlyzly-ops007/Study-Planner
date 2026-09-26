@@ -1,3 +1,4 @@
-# Phase 1/2 used only the Python standard library.
-# Phase 3 adds one dependency, for the Analytics tab's charts:
-matplotlib>=3.7
+# Only third-party dependency: the Analytics tab charts.
+# (layout="tight" figures need matplotlib 3.6+.) Everything else is the
+# Python standard library, including Tkinter.
+matplotlib>=3.6
